@@ -59,24 +59,40 @@ def arguments():
     """Parse arguments"""
     parser = argparse.ArgumentParser(description='Scans Portable Executable files for particular characteristics and '
                                                  'flags them if they are suspicious.',
-                                     epilog='')
-    parser.add_argument(help='File or directory to scan', type=check_input, dest='input')
-    parser.add_argument('--yara', help='Path to Yara rules', required=False, dest='yara')
-    parser.add_argument('--peid', help='Path to PEiD database', required=False, dest='peid')
+                                     epilog='Example: pe-scanner.py malicious_file.exe')
+    parser.add_argument(help='File or directory to scan', type=check_arguments, dest='INPUT')
+    parser.add_argument('--yara', help='Path to Yara rules', required=False, dest='YARA')
+    parser.add_argument('--peid', help='Path to PEiD database', required=False, dest='PEID')
     parser.set_defaults(func=Scanner)
     args = parser.parse_args()
     args.func(vars(args))
 
 
-def check_input(object):
-    """Check if file or directory provided is valid and accessible"""
+def check_arguments(object):
+    """Check if file or directory provided as an argument is valid, readable and, if a file, isn't 0 bytes or greater 
+    than 5 MB"""
     if not os.path.isfile(object) and not os.path.isdir(object):
-        raise argparse.ArgumentTypeError("{0} is not a valid file or directory".format(object))
+        raise argparse.ArgumentTypeError("{0} is not a file or a directory".format(object))
     if not os.access(object, os.R_OK):
         raise argparse.ArgumentTypeError("{0} is not accessible".format(object))
-    if os.path.isfile(object) and not os.path.getsize(object) > 0:
-        raise argparse.ArgumentTypeError("{0} is empty.".format(object))
+    size = os.path.getsize(object)
+    if os.path.isfile(object) and size == 0:
+        raise argparse.ArgumentTypeError("{0} is not a valid size (0 bytes)".format(object))
+    if os.path.isfile(object) and size > 5242880:
+        raise argparse.ArgumentTypeError("{0} is not a valid size ({0} KB > 5120 KB)".format(object, size / 1024.0))
     return object
+
+
+def check_file_attributes(object):
+    """Check if file is readable and isn't 0 bytes or greater than 5 MB"""
+    if not os.access(object, os.R_OK):
+        return "{0} is not accessible".format(object)
+    size = os.path.getsize(object)
+    if os.path.isfile(object) and size == 0:
+        return "{0} is not a valid size (0 bytes)".format(object)
+    if os.path.isfile(object) and size > 5242880:
+        return "{0} is not a valid size ({0} KB > 5120 KB)".format(object, size / 1024.0)
+    return
 
 
 def convert_char(ch):
@@ -176,7 +192,7 @@ class Scanner:
 
     @staticmethod
     def check_crc(pe):
-        """Determine CRC of a PE file and compare it to its pre-calculated CRC"""
+        """Determine CRC of a PE file and compare it to its embedded CRC"""
         claimed = pe.OPTIONAL_HEADER.CheckSum
         actual = pe.generate_checksum()
         crc = "Claimed: 0x{0:x}, Actual: 0x{1:x}".format(claimed, actual)
@@ -187,11 +203,15 @@ class Scanner:
         """Determines import hash for a PE file and compares it to previously calculated import hashes"""
         imphash = pe.get_imphash()
         if imphash:
-            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "imphash.db")
-            if not os.path.isfile(path):
-                cPickle.dump(dict(), open(path, 'wb'))
-            database = cPickle.load(open(path, 'rb'))
-
+            # Check if script is a symbolic link; if it is, resolve it, so imphash.db is created in script directory
+            if os.path.islink(__file__):
+                script_path = os.path.realpath(__file__)
+            else:
+                script_path = os.path.abspath(__file__)
+            database_path = os.path.join(os.path.dirname(script_path), "imphash.db")
+            if not os.path.isfile(database_path):
+                cPickle.dump(dict(), open(database_path, 'wb'))
+            database = cPickle.load(open(database_path, 'rb'))
             md5 = hashlib.md5(data).hexdigest()
             if imphash not in database.keys():
                 database[imphash] = [md5]
@@ -199,8 +219,8 @@ class Scanner:
             if md5 in md5s:
                 md5s.remove(md5)
             else:
-                database[imphash].extend([md5])
-            cPickle.dump(database, open(path, 'wb'))
+                database[imphash].append(md5)
+            cPickle.dump(database, open(database_path, 'wb'))
             if md5s:
                 md5s = [self.subheader("Imphash Hits"), NF.join(md5s)]
                 print(NF.join(md5s))
@@ -280,7 +300,7 @@ class Scanner:
 
                         resources.append([name, offset, size, language, sublanguage, filetype, hex])
         if len(resources):
-            s = "{0:<18} {1:<8} {2:<8} {3:<15} {4:<25} {5:<55} {6}"
+            s = "{0:<18} {1:<8} {2:<8} {3:<15} {4:<25} {5:<60} {6}"
             resources = [self.subheader("Resource Entries"),
                          s.format("Name", "RVA", "Size", "Language", "Sublanguage", "Type", "Data"), ("-" * 225),
                          NF.join([s.format(*resource) for resource in resources])]
@@ -288,7 +308,7 @@ class Scanner:
 
     def check_imports(self, pe):
         """Determines if a PE file is importing any libraries and whether any of those library's APIs are
-        regarded as suspicious (from a malware perspective)"""
+        regarded as suspicious from a malware perspective"""
         alerts = {'OpenProcess', 'CreateProcess', 'VirtualAllocEx', 'WriteProcessMemory', 'ReadProcessMemory',
                   'CreateRemoteThread', 'WinExec', 'ShellExecute', 'HttpSendRequest', 'InternetReadFile',
                   'InternetConnect', 'CreateService', 'StartService', 'IsDebuggerPresent', 'Sleep', 'DecodePointer',
@@ -368,14 +388,14 @@ class Scanner:
 
     def scan(self):
         """Main scanning function"""
-        object = self.ARGS['input']
+        object = self.ARGS['INPUT']
         files = []
         if os.path.isdir(object):
             for root, directories, filenames in os.walk(object):
                 for filename in filenames:
                     abspath = os.path.join(root, filename)
-                    if not os.access(abspath, os.R_OK) and not os.path.getsize(abspath) > 0:
-                        why = 'Not Accessible' if not os.access(abspath, os.R_OK) else 'Empty File'
+                    why = check_file_attributes(abspath)
+                    if why:
                         print(FAIL + "Could not scan {0}: {1}".format(filename, why) + END)
                         print()
                         break
@@ -383,8 +403,8 @@ class Scanner:
         elif os.path.isfile(object):
             files.append(object)
 
-        rule = yara.compile(self.ARGS['yara']) if self.ARGS['yara'] and 'yara' in sys.modules else None
-        peid = peutils.SignatureDatabase(self.ARGS['peid']) if self.ARGS['peid'] else None
+        rule = yara.compile(self.ARGS['YARA']) if self.ARGS['YARA'] and 'yara' in sys.modules else None
+        peid = peutils.SignatureDatabase(self.ARGS['PEID']) if self.ARGS['PEID'] else None
 
         count = 0
         for file in files:
