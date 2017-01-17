@@ -41,28 +41,28 @@ def arguments():
     """Parse arguments"""
     parser = argparse.ArgumentParser(description='Carves out Portable Executable files from arbitrary data',
                                      epilog='Example: pe-carver.py -D dump_dir -vv memory.dmp')
-    parser.add_argument(help='Input file name', type=check_input, dest='input', metavar='<input>')
+    parser.add_argument(help='Input file name', type=check_arguments, dest='INPUT', metavar='<input>')
     parser.add_argument('-D', help='Directory in which to dump carved PE files', type=check_input,
-                        default=os.path.abspath('.'), dest='output', metavar='<output>')
+                        default=os.path.abspath('.'), dest='OUTPUT', metavar='<output>')
     parser.add_argument('-v', help='Print MZ location(s). Use -vv to print failed attempts', action='count',
-                        dest='verbose', default=False)
-    parser.add_argument('--overlay', help='Enable overlay', action='store_true', default=False, dest='overlay')
-    parser.add_argument('-s', help='Size of overlay. Default: 1024 bytes', type=int, default=1024, dest='size',
+                        dest='VERBOSE', default=False)
+    parser.add_argument('--overlay', help='Enable overlay', action='store_true', default=False, dest='OVERLAY')
+    parser.add_argument('-s', help='Size of overlay. Default: 1024 bytes', type=int, default=1024, dest='SIZE',
                         metavar='<size>')
     parser.set_defaults(func=Carver)
     args = parser.parse_args()
     args.func(vars(args))
 
 
-def check_input(object):
-    """Check if file provided is valid and accessible"""
+def check_arguments(object):
+    """Check if file provided is valid, accessible and isn't 0 bytes"""
     if not os.path.isfile(object) and not os.path.isdir(object):
-        raise argparse.ArgumentTypeError("{0} is not a valid file.".format(object))
+        raise argparse.ArgumentTypeError("{0} is not a file.".format(object))
     if (os.path.isfile(object) and not os.access(object, os.R_OK)) or \
             (os.path.isdir(object) and not os.access(object, os.W_OK)):
         raise argparse.ArgumentTypeError("{0} is not accessible".format(object))
     if os.path.isfile(object) and not os.path.getsize(object) > 0:
-        raise argparse.ArgumentTypeError("{0} is empty.".format(object))
+        raise argparse.ArgumentTypeError("{0} is not a valid size (0 bytes)".format(object))
     return object
 
 
@@ -95,7 +95,7 @@ class Carver:
         try:
             self.HANDLE.seek(0)
             self.HANDLE.seek(offset)
-            return self.HANDLE.read(size + self.ARGS['size'])
+            return self.HANDLE.read(size + self.ARGS['SIZE'])
         except (OverflowError, MemoryError):
             return original
 
@@ -122,17 +122,17 @@ class Carver:
 
     def print_header(self):
         """Prints user input information"""
-        print("[+] File to carve:  {0}".format(self.ARGS['input']))
-        print("[+] Dump directory: {0}".format(self.ARGS['output']))
-        if self.ARGS['overlay']:
-            print("[+] Overlay: " + SUCCESS + "Enabled" + END + " (Overlay size set to {0})".format(self.ARGS['size']))
+        print("[+] File to carve:  {0}".format(self.ARGS['INPUT']))
+        print("[+] Dump directory: {0}".format(self.ARGS['OUTPUT']))
+        if self.ARGS['OVERLAY']:
+            print("[+] Overlay: " + SUCCESS + "Enabled" + END + " (Overlay size set to {0})".format(self.ARGS['SIZE']))
         else:
             print("[+] Overlay: " + WARNING + "Disabled" + END)
         print("[-] Starting carving process")
 
     def read_input(self):
         """Reads the input file into a buffer"""
-        self.HANDLE = open(self.ARGS['input'], 'rb')
+        self.HANDLE = open(self.ARGS['INPUT'], 'rb')
         self.BUFFER = self.HANDLE.read()
 
     def find_offset(self):
@@ -143,9 +143,9 @@ class Carver:
         """Writes PE file to working or specified directory"""
         filename = self.find_filename(pe)
         if filename:
-            outname = os.path.join(self.ARGS['output'], filename)
+            outname = os.path.join(self.ARGS['OUTPUT'], filename)
         else:
-            outname = os.path.join(self.ARGS['output'], str(count) + ext)
+            outname = os.path.join(self.ARGS['OUTPUT'], str(count) + ext)
         stream = open(outname, 'wb')
         print(data, file=stream)
 
@@ -160,14 +160,14 @@ class Carver:
                 pe.parse_data_directories(directories=pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE'])
                 ext = self.get_ext(pe)
             except pefile.PEFormatError:
-                if self.ARGS['verbose'] == 2:
+                if self.ARGS['VERBOSE'] == 2:
                     found.append(FAIL + "[*] PE found @ {0}".format("{0:#0{1}x}".format(offset, 10)) + END)
                 continue
-            if self.ARGS['verbose'] > 0:
+            if self.ARGS['VERBOSE'] > 0:
                 found.append("[*] PE found @ {0}".format("{0:#0{1}x}".format(offset, 10)))
             data = pe.trim()
             size = len(data)
-            if self.ARGS['overlay']:
+            if self.ARGS['OVERLAY']:
                 data = enable_overlay(data, offset, size)
             self.write_output(pe, data, ext, count)
             self.HANDLE.seek(0)
