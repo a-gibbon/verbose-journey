@@ -39,11 +39,12 @@ except ImportError:
 
 def arguments():
     """Parse arguments"""
-    parser = argparse.ArgumentParser(description='Carves out Portable Executable files from arbitrary data')
+    parser = argparse.ArgumentParser(description='Carves out Portable Executable files from arbitrary data',
+                                     epilog='Example: pe-carver.py -D dump_dir -vv memory.dmp')
     parser.add_argument(help='Input file name', type=check_input, dest='input', metavar='<input>')
     parser.add_argument('-D', help='Directory in which to dump carved PE files', type=check_input,
                         default=os.path.abspath('.'), dest='output', metavar='<output>')
-    parser.add_argument('-v', help='Print MZ location. Use -vv to print failed attempts', action='count',
+    parser.add_argument('-v', help='Print MZ location(s). Use -vv to print failed attempts', action='count',
                         dest='verbose', default=False)
     parser.add_argument('--overlay', help='Enable overlay', action='store_true', default=False, dest='overlay')
     parser.add_argument('-s', help='Size of overlay. Default: 1024 bytes', type=int, default=1024, dest='size',
@@ -88,15 +89,15 @@ class Carver:
             return '.exe'
         return '.bin'
 
-    def enable_overlay(self, size):
-        """Returns PE file with additional overlay size, otherwise returns"""
+    def enable_overlay(self, data, offset, size):
+        """Returns PE file with additional overlay size, otherwise returns original PE file"""
+        original = data
         try:
             self.HANDLE.seek(0)
             self.HANDLE.seek(offset)
-            pe = self.HANDLE.read(size + self.ARGS['size'])
-            return pe
+            return self.HANDLE.read(size + self.ARGS['size'])
         except (OverflowError, MemoryError):
-            return
+            return original
 
     @staticmethod
     def find_filename(pe):
@@ -111,9 +112,13 @@ class Carver:
                 elif hasattr(element, 'Var'):
                     for variable in [variable for variable in element.Var if hasattr(variable, 'entry')]:
                         version_info[variable.entry.keys()[0]] = variable.entry.values()[0]
+        exts = ['.exe', '.dll', '.sys']
         if "OriginalFilename" in version_info.keys():
+            if os.path.splitext(version_info['OriginalFilename'])[-1] not in exts:
+                if "InternalName" in version_info.keys() and os.path.splitext(version_info["InternalName"])[-1] in exts:
+                    return version_info['InternalName']
             return version_info['OriginalFilename']
-        return None
+        return
 
     def print_header(self):
         """Prints user input information"""
@@ -163,13 +168,13 @@ class Carver:
             data = pe.trim()
             size = len(data)
             if self.ARGS['overlay']:
-                data = enable_overlay(size)
+                data = enable_overlay(data, offset, size)
             self.write_output(pe, data, ext, count)
             self.HANDLE.seek(0)
             count += 1
         if found:
-            print()
-            print("[+] PE files found:")
+            print("#" * 25)
+            print("[-] PE files found:")
             print("\n".join(found))
 
 if __name__ == '__main__':
