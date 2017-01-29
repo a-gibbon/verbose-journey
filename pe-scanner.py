@@ -59,7 +59,7 @@ def arguments():
     """Parse arguments"""
     parser = argparse.ArgumentParser(description='Scans Portable Executable files for particular characteristics and '
                                                  'flags them if they are suspicious.',
-                                     epilog='Example: pe-scanner.py malicious_file.exe')
+                                     epilog='Example: pe-scanner.py malicious_file.exe / pe-scanner.py dump_dir')
     parser.add_argument(help='File or directory to scan', type=check_arguments, dest='INPUT')
     parser.add_argument('--yara', help='Path to Yara rules', required=False, dest='YARA')
     parser.add_argument('--peid', help='Path to PEiD database', required=False, dest='PEID')
@@ -72,26 +72,37 @@ def check_arguments(object):
     """Check if file or directory provided as an argument is valid, readable and, if a file, isn't 0 bytes or greater 
     than 5 MB"""
     if not os.path.isfile(object) and not os.path.isdir(object):
-        raise argparse.ArgumentTypeError("{0} is not a file or a directory".format(object))
+        raise argparse.ArgumentTypeError("{0} is not a file or a directory".format(os.path.basename(object)))
     if not os.access(object, os.R_OK):
-        raise argparse.ArgumentTypeError("{0} is not accessible".format(object))
+        raise argparse.ArgumentTypeError("{0} is not accessible".format(os.path.basename(object)))
+    if os.path.isfile(object):
+        try:
+            pefile.PE(data=open(object, 'rb').read(), fast_load=True)
+        except pefile.PEFormatError:
+            raise argparse.ArgumentTypeError("{0} is not a PE file".format(object))
     size = os.path.getsize(object)
-    if os.path.isfile(object) and size == 0:
-        raise argparse.ArgumentTypeError("{0} is not a valid size (0 bytes)".format(object))
+    if os.path.isfile(object) and not size > 0:
+        raise argparse.ArgumentTypeError("{0} is an empty file".format(os.path.basename(object)))
     if os.path.isfile(object) and size > 5242880:
-        raise argparse.ArgumentTypeError("{0} is not a valid size ({0} KB > 5120 KB)".format(object, size / 1024.0))
+        raise argparse.ArgumentTypeError("{0} is not a valid size ({0} KB > 5120 KB)".format(os.path.basename(object),
+                                                                                             size / 1024.0))
     return object
 
 
 def check_file_attributes(object):
     """Check if file is readable and isn't 0 bytes or greater than 5 MB"""
     if not os.access(object, os.R_OK):
-        return "{0} is not accessible".format(object)
+        return "Not accessible"
+    if os.path.isfile(object):
+        try:
+            pefile.PE(data=open(object, 'rb').read(), fast_load=True)
+        except pefile.PEFormatError:
+            return "Not a PE file".format(object)
     size = os.path.getsize(object)
     if os.path.isfile(object) and size == 0:
-        return "{0} is not a valid size (0 bytes)".format(object)
+        return "Empty file"
     if os.path.isfile(object) and size > 5242880:
-        return "{0} is not a valid size ({0} KB > 5120 KB)".format(object, size / 1024.0)
+        return "Not a valid size ({0} KB > 5120 KB)".format(size / 1024.0)
     return
 
 
@@ -234,7 +245,7 @@ class Scanner:
             if matches is not None:
                 for match in matches:
                     packers.append(match)
-        if len(packers):
+        if packers:
             packers = ["Packers: {0:>10}".format(','.join(packers))]
             print(NF.join(packers))
 
@@ -264,12 +275,15 @@ class Scanner:
                                  pe.OPTIONAL_HEADER.ImageBase
             idx = 0
             while True:
-                function = pe.get_dword_from_data(pe.get_data(callback_array_rva + 4 * idx, 4), 0)
+                try:
+                    function = pe.get_dword_from_data(pe.get_data(callback_array_rva + 4 * idx, 4), 0)
+                except pefile.PEFormatError:
+                    break
                 if function == 0:
                     break
                 callbacks.append(function)
                 idx += 1
-        if len(callbacks):
+        if callbacks:
             callbacks = [self.subheader("TLS Callbacks"),
                          NF.join(["0x{:<4x}".format(callback) for callback in callbacks])]
             print(NF.join(callbacks))
@@ -299,7 +313,7 @@ class Scanner:
                         sublanguage = pefile.get_sublang_name_for_lang(language_id.data.lang, language_id.data.sublang)
 
                         resources.append([name, offset, size, language, sublanguage, filetype, hex])
-        if len(resources):
+        if resources:
             s = "{0:<18} {1:<8} {2:<8} {3:<15} {4:<25} {5:<60} {6}"
             resources = [self.subheader("Resource Entries"),
                          s.format("Name", "RVA", "Size", "Language", "Sublanguage", "Type", "Data"), ("-" * 225),
@@ -309,10 +323,11 @@ class Scanner:
     def check_imports(self, pe):
         """Determines if a PE file is importing any libraries and whether any of those library's APIs are
         regarded as suspicious from a malware perspective"""
-        alerts = {'OpenProcess', 'CreateProcess', 'VirtualAllocEx', 'WriteProcessMemory', 'ReadProcessMemory',
-                  'CreateRemoteThread', 'WinExec', 'ShellExecute', 'HttpSendRequest', 'InternetReadFile',
-                  'InternetConnect', 'CreateService', 'StartService', 'IsDebuggerPresent', 'Sleep', 'DecodePointer',
-                  'EncodePointer', 'CreateNamedPipe', 'PeekNamedPipe', 'CallNamedPipe'}
+        api_alerts = ['OpenProcess', 'CreateProcess', 'VirtualAllocEx', 'WriteProcessMemory', 'ReadProcessMemory',
+                      'CreateRemoteThread', 'WinExec', 'ShellExecute', 'HttpSendRequest', 'InternetReadFile',
+                      'InternetConnect', 'CreateService', 'StartService', 'IsDebuggerPresent', 'Sleep', 'DecodePointer',
+                      'EncodePointer', 'CreateNamedPipe', 'PeekNamedPipe', 'CallNamedPipe']
+        dll_alerts = ['ntdll.dll']
         dlls = []
         imports = []
         if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
@@ -321,17 +336,17 @@ class Scanner:
                 # Check if the PE file is calling the Native API (ntdll.dll) directly and flag it as suspicious.
                 # There is functionality provided in Native API that is not exposed to Windows API, however most
                 # programs will not call the Native API directly.
-                dll = WARNING + dll + END if dll == "ntdll.dll" else dll
+                dll = WARNING + dll + END if dll in dll_alerts else dll
                 dlls.append(dll)
                 APIs = [API.name for API in library.imports if API.name]
                 for API in APIs:
-                    for alert in alerts:
+                    for alert in api_alerts:
                         if API.startswith(alert):
                             imports.append(API)
-        if len(dlls):
+        if dlls:
             dlls = [self.subheader("Imports"), NF.join(dlls)]
             print(NF.join(dlls))
-        if len(imports):
+        if imports:
             imports = [self.subheader("Suspicious IAT Alerts"), NF.join(imports)]
             print(NF.join(imports))
 
@@ -342,7 +357,7 @@ class Scanner:
             for export in [export for export in pe.DIRECTORY_ENTRY_EXPORT.symbols]:
                 exports.append(["{0:#0{1}x}".format(pe.OPTIONAL_HEADER.ImageBase + export.address, 10),
                                 export.name, export.ordinal])
-        if len(exports):
+        if exports:
             s = "{0:<11} {1} ({2})"
             exports = [self.subheader("Exports"), s.format("VirtAddr", "Name", "Ordinal"), ("-" * 225),
                        NF.join([s.format(*export) for export in exports])]
@@ -377,7 +392,7 @@ class Scanner:
                     for table in [table for table in element.StringTable]:
                         for item in [item for item in table.entries.items()]:
                             version_info.append("{0:<20} {1}".format(convert_to_printable(item[0]) + ':',
-                                                convert_to_printable(item[1])))
+                                                                     convert_to_printable(item[1])))
                 elif hasattr(element, 'Var'):
                     for variable in [variable for variable in element.Var if hasattr(variable, 'entry')]:
                         version_info.append("{0:<20} {1}".format(convert_to_printable(variable.entry.keys()[0]) + ":",
@@ -396,9 +411,9 @@ class Scanner:
                     abspath = os.path.join(root, filename)
                     why = check_file_attributes(abspath)
                     if why:
-                        print(FAIL + "Could not scan {0}: {1}".format(filename, why) + END)
+                        print(FAIL + "Could not scan {0}: {1}".format(os.path.basename(filename), why) + END)
                         print()
-                        break
+                        continue
                     files.append(abspath)
         elif os.path.isfile(object):
             files.append(object)
@@ -409,17 +424,11 @@ class Scanner:
         count = 0
         for file in files:
             data = open(file, 'rb').read()
-            try:
-                pe = pefile.PE(data=data, fast_load=True)
-                pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT'],
-                                                       pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT'],
-                                                       pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_TLS'],
-                                                       pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
-            except pefile.PEFormatError:
-                why = 'PE Parsing Exception'
-                print(FAIL + "Could not scan {0}: {1}".format(os.path.basename(file), why) + END)
-                print()
-                continue
+            pe = pefile.PE(data=data, fast_load=True)
+            pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT'],
+                                                   pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT'],
+                                                   pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_TLS'],
+                                                   pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
 
             self.header(count)
             self.get_metdata(pe, file, data)
