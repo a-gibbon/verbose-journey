@@ -42,7 +42,7 @@ def arguments():
     parser = argparse.ArgumentParser(description='Carves out Portable Executable files from arbitrary data',
                                      epilog='Example: pe-carver.py -D dump_dir -vv memory.dmp')
     parser.add_argument(help='Input file name', type=check_arguments, dest='INPUT', metavar='<input>')
-    parser.add_argument('-D', help='Directory in which to dump carved PE files', type=check_input,
+    parser.add_argument('-D', help='Directory in which to dump carved PE files', type=check_arguments,
                         default=os.path.abspath('.'), dest='OUTPUT', metavar='<output>')
     parser.add_argument('-v', help='Print MZ location(s). Use -vv to print failed attempts', action='count',
                         dest='VERBOSE', default=False)
@@ -57,12 +57,12 @@ def arguments():
 def check_arguments(object):
     """Check if file provided is valid, accessible and isn't 0 bytes"""
     if not os.path.isfile(object) and not os.path.isdir(object):
-        raise argparse.ArgumentTypeError("{0} is not a file.".format(object))
+        raise argparse.ArgumentTypeError("{0} is not a file".format(object))
     if (os.path.isfile(object) and not os.access(object, os.R_OK)) or \
             (os.path.isdir(object) and not os.access(object, os.W_OK)):
         raise argparse.ArgumentTypeError("{0} is not accessible".format(object))
     if os.path.isfile(object) and not os.path.getsize(object) > 0:
-        raise argparse.ArgumentTypeError("{0} is not a valid size (0 bytes)".format(object))
+        raise argparse.ArgumentTypeError("{0} is an empty file".format(object))
     return object
 
 
