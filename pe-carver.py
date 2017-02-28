@@ -18,6 +18,7 @@
 
 
 from __future__ import print_function
+from StringIO import StringIO
 
 import argparse
 import os
@@ -31,10 +32,11 @@ SUCCESS = "\x1b[0;30;42m"
 
 try:
     import pefile
-    import peutils
 except ImportError:
     print(FAIL + "pefile is not installed. Try pip install python-pefile or see http://code.google.com/p/pefile/" + END)
     sys.exit()
+
+os.nice(19)
 
 
 def arguments():
@@ -46,9 +48,10 @@ def arguments():
                         default=os.path.abspath('.'), dest='OUTPUT', metavar='<output>')
     parser.add_argument('-v', help='Print MZ location(s). Use -vv to print failed attempts', action='count',
                         dest='VERBOSE', default=False)
-    parser.add_argument('--overlay', help='Enable overlay', action='store_true', default=False, dest='OVERLAY')
-    parser.add_argument('-s', help='Size of overlay. Default: 1024 bytes', type=int, default=1024, dest='SIZE',
-                        metavar='<size>')
+    parser.add_argument('--overlay', help='Size of overlay. Default: Disabled', action='store', type=int, default=0,
+                        dest='OVERLAY', metavar='<overlay>')
+    parser.add_argument('--size', help='Max size of carved binary (in bytes). Default: 10 MB', action='store', type=int,
+                        default=10485760, dest='SIZE', metavar='<size>')
     parser.set_defaults(func=Carver)
     args = parser.parse_args()
     args.func(vars(args))
@@ -57,12 +60,12 @@ def arguments():
 def check_arguments(object):
     """Check if file provided is valid, accessible and isn't 0 bytes"""
     if not os.path.isfile(object) and not os.path.isdir(object):
-        raise argparse.ArgumentTypeError("{0} is not a file".format(object))
+        raise argparse.ArgumentTypeError("{0} is not a file or a directory".format(os.path.basename(object)))
     if (os.path.isfile(object) and not os.access(object, os.R_OK)) or \
             (os.path.isdir(object) and not os.access(object, os.W_OK)):
-        raise argparse.ArgumentTypeError("{0} is not accessible".format(object))
+        raise argparse.ArgumentTypeError("{0} is not accessible".format(os.path.basename(object)))
     if os.path.isfile(object) and not os.path.getsize(object) > 0:
-        raise argparse.ArgumentTypeError("{0} is an empty file".format(object))
+        raise argparse.ArgumentTypeError("{0} is an empty file".format(os.path.basename(object)))
     return object
 
 
@@ -89,15 +92,14 @@ class Carver:
             return '.exe'
         return '.bin'
 
-    def enable_overlay(self, data, offset, size):
+    def enable_overlay(self, data, offset):
         """Returns PE file with additional overlay size, otherwise returns original PE file"""
-        original = data
         try:
             self.HANDLE.seek(0)
             self.HANDLE.seek(offset)
-            return self.HANDLE.read(size + self.ARGS['SIZE'])
+            return self.HANDLE.read(len(data) + self.ARGS['SIZE'])
         except (OverflowError, MemoryError):
-            return original
+            return data
 
     @staticmethod
     def find_filename(pe):
@@ -114,9 +116,13 @@ class Carver:
                         version_info[variable.entry.keys()[0]] = variable.entry.values()[0]
         exts = ['.exe', '.dll', '.sys']
         if "OriginalFilename" in version_info.keys():
-            if os.path.splitext(version_info['OriginalFilename'])[-1] not in exts:
-                if "InternalName" in version_info.keys() and os.path.splitext(version_info["InternalName"])[-1] in exts:
+            if os.path.splitext(version_info['OriginalFilename'])[-1].lower() not in exts:
+                if "InternalName" in version_info.keys() \
+                        and os.path.splitext(version_info["InternalName"])[-1].lower() in exts:
                     return version_info['InternalName']
+                elif os.path.splitext(version_info['OriginalFilename'])[-1].lower() == ".mui":
+                    if os.path.splitext(os.splitext(version_info['OriginalFilename'])[0])[-1].lower() in exts:
+                        return os.splitext(version_info['OriginalFilename'])[0]
             return version_info['OriginalFilename']
         return
 
@@ -132,7 +138,7 @@ class Carver:
 
     def read_input(self):
         """Reads the input file into a buffer"""
-        self.HANDLE = open(self.ARGS['INPUT'], 'rb')
+        self.HANDLE = StringIO(open(self.ARGS['INPUT'], 'rb').read())
         self.BUFFER = self.HANDLE.read()
 
     def find_offset(self):
@@ -152,30 +158,24 @@ class Carver:
     def carve_files(self):
         """Carves out embedded PE files"""
         count = 1
-        found = []
         for offset in self.OFFSETS:
             self.HANDLE.seek(offset)
             try:
-                pe = pefile.PE(data=self.HANDLE.read(), fast_load=True)
+                pe = pefile.PE(data=self.HANDLE.read(self.ARGS['SIZE']), fast_load=True)
                 pe.parse_data_directories(directories=pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE'])
                 ext = self.get_ext(pe)
             except pefile.PEFormatError:
                 if self.ARGS['VERBOSE'] == 2:
-                    found.append(FAIL + "[*] PE found @ {0}".format("{0:#0{1}x}".format(offset, 10)) + END)
+                    print(FAIL + "[*] PE found @ {0}".format("{0:#0{1}x}".format(offset, 10)) + END)
                 continue
             if self.ARGS['VERBOSE'] > 0:
-                found.append("[*] PE found @ {0}".format("{0:#0{1}x}".format(offset, 10)))
+                print("[*] PE found @ {0}".format("{0:#0{1}x}".format(offset, 10)))
             data = pe.trim()
-            size = len(data)
             if self.ARGS['OVERLAY']:
-                data = enable_overlay(data, offset, size)
+                data = enable_overlay(data, offset)
             self.write_output(pe, data, ext, count)
             self.HANDLE.seek(0)
             count += 1
-        if found:
-            print("#" * 25)
-            print("[-] PE files found:")
-            print("\n".join(found))
 
 if __name__ == '__main__':
     arguments()
