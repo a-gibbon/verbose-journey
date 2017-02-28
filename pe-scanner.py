@@ -23,6 +23,7 @@ import binascii
 import copy
 import cPickle
 import hashlib
+import imp
 import os
 import re
 import string
@@ -34,6 +35,7 @@ FAIL = "\x1b[0;30;41m"
 WARNING = "\x1b[0;30;43m"
 SUCCESS = "\x1b[0;30;42m"
 HEADING = "\x1b[0;30;47m"
+
 NF = "\n"
 
 try:
@@ -84,7 +86,7 @@ def check_arguments(object):
     if os.path.isfile(object) and not size > 0:
         raise argparse.ArgumentTypeError("{0} is an empty file".format(os.path.basename(object)))
     if os.path.isfile(object) and size > 5242880:
-        raise argparse.ArgumentTypeError("{0} is not a valid size ({0} KB > 5120 KB)".format(os.path.basename(object),
+        raise argparse.ArgumentTypeError("{0} is not a valid size ({0:.1f} KB > 5120 KB)".format(os.path.basename(object),
                                                                                              size / 1024.0))
     return object
 
@@ -102,7 +104,7 @@ def check_file_attributes(object):
     if os.path.isfile(object) and size == 0:
         return "Empty file"
     if os.path.isfile(object) and size > 5242880:
-        return "Not a valid size ({0} KB > 5120 KB)".format(size / 1024.0)
+        return "Not a valid size ({0:.1f} KB > 5120 KB)".format(size / 1024.0)
     return
 
 
@@ -156,7 +158,7 @@ class Scanner:
         """There are two versions of python-magic floating around, and annoyingly, the interface
         changed between versions, so we try one method and if it fails, then we try the other.
         NOTE: you may need to alter the magic_file for your system to point to the magic file."""
-        if 'magic' in sys.modules:
+        if imp.find_module('magic'):
             try:
                 m = magic.open(magic.MAGIC_NONE)
                 m.load()
@@ -190,10 +192,14 @@ class Scanner:
         position = 0
         name = None
         for section in pe.sections:
-            if address in range(section.VirtualAddress, section.VirtualAddress + section.Misc_VirtualSize + 1):
-                name = re.sub("\x00", "", section.Name)
-                break
-            position += 1
+            try:
+                if address in range(section.VirtualAddress, section.VirtualAddress + section.Misc_VirtualSize + 1):
+                    name = re.sub("\x00", "", section.Name)
+                    break
+            except MemoryError:
+                pass
+            finally:
+                position += 1
         ep = "{0} {1} {2:d}/{3:d}".format(hex(address + pe.OPTIONAL_HEADER.ImageBase), name, position,
                                           len(pe.sections))
         # Alert if the EP section is not in a known good section or if its in the last PE section
@@ -290,6 +296,7 @@ class Scanner:
 
     def check_resources(self, pe):
         """Determines the resource entries in a PE file"""
+        hex_dump = None
         resources = []
         if hasattr(pe, 'DIRECTORY_ENTRY_RESOURCE'):
             types = [type for type in pe.DIRECTORY_ENTRY_RESOURCE.entries if hasattr(type, 'directory')]
@@ -308,11 +315,11 @@ class Scanner:
                         size = language_id.data.struct.Size
                         data = pe.get_data(offset, size)
                         filetype = self.get_filetype(data)
-                        hex = hexdump.hexdump(data, result='return').split('\n')[0]
                         language = pefile.LANG.get(language_id.data.lang, '*unknown*')
                         sublanguage = pefile.get_sublang_name_for_lang(language_id.data.lang, language_id.data.sublang)
-
-                        resources.append([name, offset, size, language, sublanguage, filetype, hex])
+                        if imp.find_module('hexdump'):
+                            hex_dump = hexdump.hexdump(data, result='return').split('\n')[0]
+                        resources.append([name, offset, size, language, sublanguage, filetype, hex_dump])
         if resources:
             s = "{0:<18} {1:<8} {2:<8} {3:<15} {4:<25} {5:<60} {6}"
             resources = [self.subheader("Resource Entries"),
@@ -425,24 +432,27 @@ class Scanner:
         for file in files:
             data = open(file, 'rb').read()
             pe = pefile.PE(data=data, fast_load=True)
-            pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT'],
-                                                   pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT'],
-                                                   pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_TLS'],
-                                                   pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
-
-            self.header(count)
-            self.get_metdata(pe, file, data)
-            self.check_imphash(pe, data)
-            self.check_packers(pe, peid)
-            self.check_yara(rule, data)
-            self.check_tls(pe)
-            self.check_resources(pe)
-            self.check_imports(pe)
-            self.check_exports(pe)
-            self.check_sections(pe)
-            self.check_version_info(pe)
-            print()
-            count += 1
+            try:
+                pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT'],
+                                                       pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT'],
+                                                       pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_TLS'],
+                                                       pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
+            except AttributeError:
+                pass
+            finally:
+                self.header(count)
+                self.get_metdata(pe, file, data)
+                self.check_imphash(pe, data)
+                self.check_packers(pe, peid)
+                self.check_yara(rule, data)
+                self.check_tls(pe)
+                self.check_resources(pe)
+                self.check_imports(pe)
+                self.check_exports(pe)
+                self.check_sections(pe)
+                self.check_version_info(pe)
+                print()
+                count += 1
 
 
 if __name__ == "__main__":
