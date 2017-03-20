@@ -430,54 +430,54 @@ class Scanner:
 
     def scan(self):
         """Main scanning function"""
-        object = self.ARGS['INPUT']
-        files = []
-        if os.path.isdir(object):
-            for root, directories, filenames in os.walk(object):
-                for filename in filenames:
-                    abspath = os.path.join(root, filename)
-                    why = self.check_file_attributes(abspath)
-                    if why:
-                        print(FAIL + "Did not scan {0}: {1}".format(os.path.basename(filename), why) + END)
-                        print()
-                        continue
-                    files.append(abspath)
-        elif os.path.isfile(object):
-            files.append(object)
+        try:
+            object = self.ARGS['INPUT']
+            files = []
+            if os.path.isdir(object):
+                for root, directories, filenames in os.walk(object):
+                    for filename in filenames:
+                        abspath = os.path.join(root, filename)
+                        why = self.check_file_attributes(abspath)
+                        if why:
+                            print(FAIL + "Did not scan {0}: {1}".format(os.path.basename(filename), why) + END)
+                            print()
+                            continue
+                        files.append(abspath)
+            elif os.path.isfile(object):
+                files.append(object)
 
-        rule = yara.compile(self.ARGS['YARA']) if self.ARGS['YARA'] and 'yara' in sys.modules else None
-        peid = peutils.SignatureDatabase(self.ARGS['PEID']) if self.ARGS['PEID'] else None
+            rule = yara.compile(self.ARGS['YARA']) if self.ARGS['YARA'] and 'yara' in sys.modules else None
+            peid = peutils.SignatureDatabase(self.ARGS['PEID']) if self.ARGS['PEID'] else None
 
-        count = 0
-        for file in files:
-            self.FILE = file
-            data = open(file, 'rb').read()
-            pe = pefile.PE(data=data, fast_load=True)
-            try:
-                pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT'],
-                                                       pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT'],
-                                                       pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_TLS'],
-                                                       pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
-            except AttributeError:
-                pass
-            finally:
-                self.header(count)
-                self.get_metdata(pe, file, data)
-                self.check_imphash(pe, data)
-                self.check_packers(pe, peid)
-                self.check_yara(rule, data)
-                self.check_tls(pe)
-                self.check_resources(pe)
-                self.check_imports(pe)
-                self.check_exports(pe)
-                self.check_sections(pe)
-                self.check_version_info(pe)
-                print()
-                count += 1
+            count = 0
+            for file in files:
+                self.FILE = file
+                data = open(file, 'rb').read()
+                pe = pefile.PE(data=data, fast_load=True)
+                try:
+                    pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT'],
+                                                           pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT'],
+                                                           pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_TLS'],
+                                                           pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
+                except AttributeError:
+                    pass
+                finally:
+                    self.header(count)
+                    self.get_metdata(pe, file, data)
+                    self.check_imphash(pe, data)
+                    self.check_packers(pe, peid)
+                    self.check_yara(rule, data)
+                    self.check_tls(pe)
+                    self.check_resources(pe)
+                    self.check_imports(pe)
+                    self.check_exports(pe)
+                    self.check_sections(pe)
+                    self.check_version_info(pe)
+                    print()
+                    count += 1
+        except KeyboardInterrupt:
+            print("KeyboardInterrupt")
 
 
 if __name__ == '__main__':
-    try:
-        arguments()
-    except KeyboardInterrupt:
-        print("KeyboardInterrupt")
+    arguments()
