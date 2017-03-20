@@ -101,8 +101,7 @@ class Carver:
         except (OverflowError, MemoryError):
             return data
 
-    @staticmethod
-    def find_filename(pe):
+    def find_filename(self, pe):
         """Returns OriginalFilename of PE file (if available)"""
         version_info = {}
         if hasattr(pe, 'VS_VERSIONINFO'):
@@ -116,6 +115,8 @@ class Carver:
                         version_info[variable.entry.keys()[0]] = variable.entry.values()[0]
         exts = ['.exe', '.dll', '.sys']
         if "OriginalFilename" in version_info.keys():
+            if os.path.splitext(version_info['OriginalFilename'])[-1] == str():
+                return os.path.splitext(version_info['OriginalFilename'])[-1] + self.get_ext(pe)
             if os.path.splitext(version_info['OriginalFilename'])[-1].lower() not in exts:
                 if "InternalName" in version_info.keys() \
                         and os.path.splitext(version_info["InternalName"])[-1].lower() in exts:
@@ -157,25 +158,28 @@ class Carver:
 
     def carve_files(self):
         """Carves out embedded PE files"""
-        count = 1
-        for offset in self.OFFSETS:
-            self.HANDLE.seek(offset)
-            try:
-                pe = pefile.PE(data=self.HANDLE.read(self.ARGS['SIZE']), fast_load=True)
-                pe.parse_data_directories(directories=pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE'])
-                ext = self.get_ext(pe)
-            except pefile.PEFormatError:
-                if self.ARGS['VERBOSE'] == 2:
-                    print(FAIL + "[*] PE found @ {0}".format("{0:#0{1}x}".format(offset, 10)) + END)
-                continue
-            if self.ARGS['VERBOSE'] > 0:
-                print("[*] PE found @ {0}".format("{0:#0{1}x}".format(offset, 10)))
-            data = pe.trim()
-            if self.ARGS['OVERLAY']:
-                data = enable_overlay(data, offset)
-            self.write_output(pe, data, ext, count)
-            self.HANDLE.seek(0)
-            count += 1
+        try:
+            count = 1
+            for offset in self.OFFSETS:
+                self.HANDLE.seek(offset)
+                try:
+                    pe = pefile.PE(data=self.HANDLE.read(self.ARGS['SIZE']), fast_load=True)
+                    pe.parse_data_directories(directories=pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE'])
+                    ext = self.get_ext(pe)
+                except pefile.PEFormatError:
+                    if self.ARGS['VERBOSE'] == 2:
+                        print(FAIL + "[*] PE found @ {0}".format("{0:#0{1}x}".format(offset, 10)) + END)
+                    continue
+                if self.ARGS['VERBOSE'] > 0:
+                    print("[*] PE found @ {0}".format("{0:#0{1}x}".format(offset, 10)))
+                data = pe.trim()
+                if self.ARGS['OVERLAY']:
+                    data = enable_overlay(data, offset)
+                self.write_output(pe, data, ext, count)
+                self.HANDLE.seek(0)
+                count += 1
+        except KeyboardInterrupt:
+            print("KeyboardInterrupt")
 
 if __name__ == '__main__':
     arguments()
