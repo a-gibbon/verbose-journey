@@ -1,483 +1,748 @@
 #!/usr/bin/env python
-# Copyright (C) 2016
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
-#
-# Credit: Michael Ligh (michael<at>memoryanalysis<dot>net)
 
 from __future__ import print_function
-from hexdump import hexdump
 
 import argparse
+import base64
 import binascii
-import copy
+import cgi
+import contextlib
 import cPickle
+import datetime
 import hashlib
-import imp
-import logging
 import os
+import psutil
 import re
 import string
+import StringIO
 import sys
-import time
-
-END = "\x1b[0m"
-FAIL = "\x1b[0;30;41m"
-WARNING = "\x1b[0;30;43m"
-SUCCESS = "\x1b[0;30;42m"
-HEADING = "\x1b[0;30;47m"
-
-NF = "\n"
 
 try:
     import pefile
     import peutils
 except ImportError:
-    print(FAIL + "pefile is not installed. Try pip install python-pefile or see http://code.google.com/p/pefile/" + END)
+    print("pefile is not installed. Try pip install python-pefile or see http://code.google.com/p/pefile/")
     sys.exit()
 
 try:
     import magic
 except ImportError:
-    print(WARNING + "python-magic is not installed (file types will not be available). Try pip install python-magic" +
-          END)
+    print("python-magic is not installed (file types will not be available). Try pip install python-magic")
 
 try:
-    from hexdump import hexdump
+    import hexdump
 except ImportError:
-    print(WARNING + "hexdump is not installed. Try pip install hexdump" + END)
+    print("hexdump is not installed (hexdumps will not be available). Try pip install hexdump")
 
-logging.basicConfig(filename=os.path.join(os.path.dirname(__file__), 'error.log'), level=logging.ERROR)
+# GLOBAL STATIC VARIABLES
+# Check if python script is a symbolic link; if it is, resolve it, else assume it's a file
+if os.path.islink(__file__):
+    SCRIPT_PATH = os.path.dirname(os.path.realpath(__file__))
+else:
+    SCRIPT_PATH = os.path.dirname(os.path.abspath(__file__))
 
+IMPHASH_DB = os.path.join(SCRIPT_PATH, 'imphash.db')
+
+JQUERY_FILE_PATH  = os.path.join(SCRIPT_PATH, "jquery-3.2.1.min.js")
+
+API_ALERTS = ['accept', 'AddCredential', 'bind', 'CallNamedPipe', 'CheckRemoteDebuggerPresent', 'closesocket', 'connect', 'ConnectNamedPipe', 'CreateFileMapping',
+              'CreateNamedPipe', 'CreateProcess', 'CreateToolhelp32Snapshot', 'CreateRemoteThread', 'CreateService', 'CryptDecrypt', 'CryptEncrypt', 'DecodePointer',
+              'DecodeRemotePointer', 'DeviceIoControl', 'DisconnectNamedPipe', 'DNSQuery', 'EncodePointer', 'EncodeRemotePointer', 'FindWindows', 'FindFirstFile',
+              'FindNextFile', 'FltRegisterFilter', 'FtpGetFile', 'FtpOpenFile', 'GetCommandLine', 'GetCredentials', 'GetThreadContext', 'GetDriveType',
+              'GetHostByAddr', 'GetHostByName', 'GetSystemMetrics', 'GetTempFileName', 'GetTempPath', 'GetTickCount', 'GetUpdateRect', 'GetUpdateRgn',
+              'GetUrlCacheEntryInfo', 'GetWindowProcessThreadId', 'HttpSendRequest', 'HttpQueryInfo', 'IcmpSendEcho', 'IsDebuggerPresent', 'InternetCloseHandle',
+              'InternetConnect', 'InternetCrackUrl', 'InternetQueryDataAvailable', 'InternetGetConnectedState', 'InternetOpen', 'InternetQueryOption',
+              'InternetReadFile', 'InternetWriteFile', 'LdrLoadDll', 'LockResource', 'listen', 'MapViewOfFile', 'Nt', 'OutputDebugString', 'OpenFileMapping',
+              'OpenProcess', 'PeekNamedPipe', 'recv', 'ReadProcessMemory', 'send', 'SendInput', 'sendto', 'SetKeyboardState', 'SetWindowsHook', 'ShellExecute',
+              'Sleep', 'socket', 'StartService', 'Toolhelp32ReadProcessMemory', 'UnhandledExceptionFilter', 'URLDownload', 'VirtualAlloc', 'VirtualProtect',
+              'WinExec', 'WriteProcessMemory', 'WSASend', 'WSASocket', 'WSAStartup', 'Zw']
+
+DLL_ALERTS = ['ntoskernel.exe', 'hal.dll', 'ndis.sys']
+
+os.environ['COLUMNS'] = '125'
 
 def arguments():
     """Parse arguments"""
-    parser = argparse.ArgumentParser(description='Scans Portable Executable files and flags suspicious characteristics.',
-                                     epilog='Example: pe-scanner.py malicious_file.exe / pe-scanner.py dump_dir')
-    parser.add_argument(help='File or directory to scan', type=check_arguments, dest='INPUT')
-    parser.add_argument('--size', help='Max file size of PE files that will be scanned. Default: 5 MB', type=int,
-                        required=False, default=5242880, dest='SIZE')
-    parser.add_argument('--yara', help='Path to Yara rules', required=False, dest='YARA')
-    parser.add_argument('--peid', help='Path to PEiD database', required=False, dest='PEID')
-    parser.set_defaults(func=Scanner)
+    parser = argparse.ArgumentParser(description='Scans Portable Executable (PE) files for suspicious / malicious characteristics',
+                                     epilog='Example: pe-scanner.py malicious_binary.exe /path/to/malicious/binaries/')
+    parser.add_argument(help='file(s) or directory(s) to scan', nargs='+', type=check_arguments, dest='INPUT')
+    parser.add_argument('-O', help='output filename for the results to be saved to (HTML format). If no filename is given, results are passed to stdout (plaintext)', nargs='?', type=argparse.FileType('w'), default=sys.stdout, dest='OUTPUT')
+    parser.add_argument('--yara', help='path to Yara rules', nargs='+', type=check_arguments, dest='YARA')
+    parser.add_argument('--peid', help='path to PEiD database', type=check_arguments, dest='PEID')
+    parser.set_defaults(func=Scan)
     args = parser.parse_args()
     args.func(vars(args))
 
 
 def check_arguments(object):
-    """Check if file or directory provided as an argument is valid and accessible"""
-    if not os.path.isfile(object) and not os.path.isdir(object):
-        raise argparse.ArgumentTypeError("{0} is not a file or a directory".format(os.path.basename(object)))
-    if not os.access(object, os.R_OK):
-        raise argparse.ArgumentTypeError("{0} is not accessible".format(os.path.basename(object)))
-    return object
-
-
-def convert_char(ch):
-    if ch not in string.printable:
-        if ord(ch) == 169:
-            ch = "(C)"
-        elif ord(ch) == 174:
-            ch = "(R)"
-        else:
-            ch = r"\x{:02x}".format(ord(ch))
-    return ch
-
-
-def convert_to_printable(s):
-    s = str().join([convert_char(ch) for ch in s])
-    return s
-
-
-class Scanner:
-    def __init__(self, args):
-        """Initialiser"""
-        self.ARGS = args
-        self.FILE = None
-        self.scan()
-
-    @staticmethod
-    def header(count):
-        print(HEADING + "{0}{1}{0}".format(("#" * 111), " Record: {0} ".format(str(count).zfill(3))) + END)
-
-    @staticmethod
-    def subheader(message):
-        return "{1}{2}{1}{0}".format(("=" * 235), NF, message)
-
-    def check_file_attributes(self, object):
-        """Check if file is readable and isn't 0 bytes or greater than the specified size (default: 5 MB)"""
+    """Check if arguments provided are valid and accessible"""
+    if os.path.isfile(object):
         if not os.access(object, os.R_OK):
-            return "Not accessible"
-        if os.path.isfile(object):
-            try:
-                pefile.PE(data=open(object, 'rb').read(), fast_load=True)
-            except pefile.PEFormatError:
-                return "Not a PE file".format(object)
-        size = os.path.getsize(object)
-        if os.path.isfile(object) and size == 0:
-            return "Empty file"
-        if os.path.isfile(object) and size > self.ARGS['SIZE']:
-            return "Larger than {0} KB".format(self.ARGS['SIZE'] / 1024.0)
-        return
+            raise argparse.ArgumentTypeError("{0} is not accessible".format(object))
+        if not os.path.getsize(object) > 0:
+            raise argparse.ArgumentTypeError("{0} is an empty file".format(object))
+        return os.path.abspath(object)
+    elif os.path.isdir(object):
+        if not (os.access(object, os.R_OK) and os.access(object, os.X_OK)):
+            raise argparse.ArgumentTypeError("{0} is not accessible".format(object))
+        return os.path.abspath(object)
+    raise argparse.ArgumentTypeError("{0} is not a file or a directory".format(object))
+
+
+class Colours:
+    END     = "\x1b[0m"
+    ERROR   = "\x1b[0;30;41m"
+    HEADING = "\x1b[0;30;47m"
+    SUCCESS = "\x1b[0;30;42m"
+    WARNING = "\x1b[0;30;43m"
+
+
+class Scan:
+    def __init__(self, args):
+        self.ARGS = args
+        self.OUTPUT = []
+        self.LOCKED = False
+        self.IMPHASHES = None
+        self.SCAN_TIME = datetime.datetime.now().replace(microsecond=0).isoformat()
+        self.collect()
 
     @staticmethod
-    def get_timestamp(pe):
-        """Determines PE files compile timestamp"""
-        ts = pe.FILE_HEADER.TimeDateStamp
-        timestamp = "0x{:<8X}".format(ts)
-        try:
-            timestamp += " [{0} UTC]".format(time.asctime(time.gmtime(ts)))
-            that_year = time.gmtime(ts)[0]
-            this_year = time.gmtime(time.time())[0]
-            if that_year < 2000 or that_year > this_year:
-                timestamp = WARNING + timestamp + END
-        except ValueError:
-            timestamp = WARNING + timestamp + END
-        return timestamp
+    def progress_start():
+        """Starts progress bar"""
+        sys.stdout.write("[+] Parsing progress: " + "[" + "-" * 40 + "]")
+        sys.stdout.flush()
+
+    @staticmethod
+    def progress_update(count, total):
+        """Updates progress bar"""
+        sys.stdout.write("\r" + "[+] Parsing progress: " + "[" + "#" * int(count * 40.0 / total))
+        sys.stdout.flush()
+
+    @staticmethod
+    def progress_end():
+        """Finalises progress bar"""
+        sys.stdout.write("\r" + "[+] Parsing progress: " + "[" + "#" * 15 + " COMPLETE " + "#" * 15 + "]" + "\n" * 2)
+        sys.stdout.flush()
+
+    @staticmethod
+    def convert_char(char):
+        if char not in string.printable:
+            if ord(char) == 169:
+                char = "(C)"
+            elif ord(char) == 174:
+                char = "(R)"
+            elif ord(char) == 0:
+                char = ""
+            else:
+                char = r"\x{0:02x}".format(ord(char))
+        return char
+
+    def convert_to_printable(self, string):
+        return "".join([self.convert_char(char) for char in string])
 
     @staticmethod
     def get_filetype(data):
-        if imp.find_module('magic'):
+        """Attempts to return the filetype of any given data"""
+        filetype = None
+        if 'magic' in sys.modules:
+            # If the object is an instance of pefile.PE, use __data__ attribute of pefile instance to acquire file content
+            if isinstance(data, pefile.PE):
+                data = data.__data__
             try:
-                m = magic.open(magic.NONE)
-                m.load()
-                return m.buffer(data) if len(m.buffer(data)) < 75 else m.buffer(data).split(',')[0]
+                magic_ = magic.open(magic.NONE)
+                magic_.load()
+                with contextlib.closing(StringIO.StringIO(bytearray(data))) as buffer_:
+                    filetype = magic_.buffer(buffer_.read())
+                # If textual description of contents is too long, split by comma
+                filetype = filetype if len(filetype) < 75 else filetype.split(',')[0]
             except AttributeError:
-                try:
-                    return magic.from_buffer(data) if len(magic.from_buffer(data)) < 75 else \
-                        magic.from_buffer(data).split(',')[0]
-                except magic.MagicException:
-                    pass
-        return str()
-
-    def get_metdata(self, pe, file, data):
-        """Determine metadata for a PE file"""
-        metadata = ["File:    {0}".format(os.path.basename(file)),
-                    "Size:    {0} bytes".format(len(data)),
-                    "Type:    {0}".format(self.get_filetype(data)),
-                    "MD5:     {0}".format(hashlib.md5(data).hexdigest()),
-                    "SHA1:    {0}".format(hashlib.sha1(data).hexdigest()),
-                    "Imphash: {0}".format(pe.get_imphash()),
-                    "Date:    {0}".format(self.get_timestamp(pe)),
-                    "EP:      {0}".format(self.check_ep_section(pe)),
-                    "CRC:     {0}".format(self.check_crc(pe))]
-        metadata = [self.subheader("Metadata"), NF.join(metadata)]
-        print(NF.join(metadata))
+                pass
+        return filetype
 
     @staticmethod
-    def check_ep_section(pe):
-        """Determines if the entry point address for a PE file is suspicious"""
-        ep = str()
+    def get_time_date_stamp(pe):
+        """Determines if a PE files compile timedate stamp is suspicious"""
+        time_date_stamp = pe.FILE_HEADER.dump_dict()['TimeDateStamp']['Value']
         try:
-            address = pe.OPTIONAL_HEADER.AddressOfEntryPoint
-            position = 0
-            name = None
-            for section in pe.sections:
-                try:
-                    if address in range(section.VirtualAddress, section.VirtualAddress + section.Misc_VirtualSize + 1):
-                        name = re.sub("\x00", "", section.Name)
-                        break
-                except MemoryError:
-                    pass
-                finally:
-                    position += 1
-            ep = "{0} {1} {2:d}/{3:d}".format(hex(address + pe.OPTIONAL_HEADER.ImageBase), name, position,
-                                              len(pe.sections))
-            # Alert if the EP section is not in a known good section or if its in the last PE section
-            ep = WARNING + ep + END \
-                if (name not in ['.text', '.code', 'CODE', 'INIT', 'PAGE']) or position == len(pe.sections) else ep
-        except Exception as e:
-            logging.error("File: {0} [Line {1}: {2}]".format(self.FILE, sys.exc_info()[-1].tb_lineno, e))
+            that_year = datetime.datetime.utcfromtimestamp(pe.FILE_HEADER.TimeDateStamp).year
+            this_year = datetime.datetime.now().year
+            # 2000 is an arbitrary year
+            if that_year < 2000 or that_year > this_year:
+                return [time_date_stamp, "*"]
+        except ValueError:
+            return [time_date_stamp, "*"]
+        return [time_date_stamp]
+
+    def check_ep_section(self, pe):
+        """Determines if the entry point address for a PE file is suspicious"""
+        # https://en.wikibooks.org/wiki/X86_Disassembly/Windows_Executable_Files
+        # OPTIONAL_HEADER (AddressOfEntryPoint)
+        # "A pointer to the entry point function, relative to image base address. For executable files, this is the starting address. For device drivers, this is the
+        # initialization function. The entry point function is optional for DLLs. When no entry point is present, this member is zero."
+        if pe.OPTIONAL_HEADER.AddressOfEntryPoint == 0:
+            if pe.is_dll():
+                return ["No entry point"]
+            else:
+                return ["No entry point. Corrupt?"]
+        name = None
+        position = 0
+        for section in pe.sections:
+            position += 1
+            if pe.OPTIONAL_HEADER.AddressOfEntryPoint in range(section.VirtualAddress, section.VirtualAddress + section.Misc_VirtualSize + 1):
+                name = self.convert_to_printable(section.Name)
+                break
+        rva = hex(pe.OPTIONAL_HEADER.AddressOfEntryPoint + pe.OPTIONAL_HEADER.ImageBase)
+        raw = hex(pe.OPTIONAL_HEADER.AddressOfEntryPoint + section.PointerToRawData - section.VirtualAddress)
+        ep  = "{0} (RVA) / {1} (RAW) {2} {3:d}/{4:d}".format(rva, raw, name, position, len(pe.sections))
+
+        # Alert if the EP section is not in a known good section or if its not the first PE section
+        ep = [ep, "*"] if (name not in ['.text', '.code', 'CODE', 'INIT', 'PAGE'] or position != 1) else [ep]
         return ep
 
     @staticmethod
     def check_crc(pe):
-        """Determine CRC of a PE file and compare it to its embedded CRC"""
-        crc = str()
-        try:
-            claimed = pe.OPTIONAL_HEADER.CheckSum
-            actual = pe.generate_checksum()
-            crc = "Claimed: 0x{0:x}, Actual: 0x{1:x}".format(claimed, actual)
-            crc = WARNING + crc + END if actual != claimed else crc
-        except Exception as e:
-            logging.error("File: {0} [Line {1}: {2}]".format(self.FILE, sys.exc_info()[-1].tb_lineno, e))
+        """Determine if a CRC comparison between the generated checksum and the checksum found within the OPTIONAL_HEADER is suspicious"""
+        # CheckSum (dword) field in IMAGE_OPTIONAL_HEADER fields (from https://msdn.microsoft.com/en-us/library/ms809762.aspx)
+        # "Supposedly a CRC checksum of the file. As in other Microsoft executable formats, this field is ignored and set to 0. 
+        #  The one exception to this rule is for trusted services and these EXEs must have a valid checksum."
+        
+        claimed = pe.OPTIONAL_HEADER.CheckSum
+        actual = pe.generate_checksum()
+        crc = "Claimed: 0x{0:x}, Actual: 0x{1:x}".format(claimed, actual)
+
+        # Alert if generated CRC checksum does not match with CRC checksum in the OPTIONAL_HEADER
+        crc = [crc, "*"] if actual != claimed and claimed != 0 else [crc]
         return crc
 
-    def check_imphash(self, pe, data):
-        """Determines import hash for a PE file and compares it to previously calculated import hashes"""
-        try:
-            imphash = pe.get_imphash()
-            if imphash:
-                # Check if script is a symbolic link; if it is, resolve it, so imphash.db is created in script directory
-                if os.path.islink(__file__):
-                    script_path = os.path.realpath(__file__)
+
+    def check_imphash(self, pe):
+        """Calculates import hash for a PE file and compares it to previously calculated import hashes"""
+        imphash = pe.get_imphash()
+        MD5s = []
+        if imphash:
+            MD5 = [hashlib.md5(bytearray(pe.__data__)).hexdigest()]
+            if imphash in self.IMPHASHES.keys():
+                # If import hash is already in import hash database create a shallow copy of MD5s list
+                MD5s = self.IMPHASHES[imphash][:]
+                if MD5 in MD5s:
+                    # If the MD5 hash of the current binary is in the list, remove it
+                    MD5s.remove(MD5)
                 else:
-                    script_path = os.path.abspath(__file__)
-                database_path = os.path.join(os.path.dirname(script_path), "imphash.db")
-                if not os.path.isfile(database_path):
-                    cPickle.dump(dict(), open(database_path, 'wb'))
-                database = cPickle.load(open(database_path, 'rb'))
-                md5 = hashlib.md5(data).hexdigest()
-                if imphash not in database.keys():
-                    database[imphash] = [md5]
-                md5s = copy.copy(database[imphash])
-                if md5 in md5s:
-                    md5s.remove(md5)
-                else:
-                    database[imphash].append(md5)
-                cPickle.dump(database, open(database_path, 'wb'))
-                if md5s:
-                    md5s = [self.subheader("Imphash Hits"), NF.join(md5s)]
-                    print(NF.join(md5s))
-        except Exception as e:
-            logging.error("File: {0} [Line {1}: {2}]".format(self.FILE, sys.exc_info()[-1].tb_lineno, e))
+                    # Otherwise, append MD5 to the list for that import hash
+                    self.IMPHASHES[imphash].append(MD5)
+            else:
+                # Otherwise create a list containing MD5 of current binary
+                self.IMPHASHES[imphash] = [MD5]
+        return MD5s
+
+# NEED TO FIX UP / TEST THESE
 
     @staticmethod
-    def check_packers(pe, peid):
+    def check_packers(pe):
         """Determines if a PE file is packed (PEiD database required)"""
         packers = []
-        if peid:
-            try:
-                matches = peid.match(pe, ep_only=True)
-                if matches is not None:
-                    for match in matches:
-                        packers.append(match)
-                if packers:
-                    packers = ["Packers: {0:>10}".format(','.join(packers))]
-                    print(NF.join(packers))
-            except Exception as e:
-                logging.error("File: {0} [Line {1}: {2}]".format(self.FILE, sys.exc_info()[-1].tb_lineno, e))
+#        peid = peutils.SignatureDatabase(self.ARGS['PEID'])
+#        if peid:
+#            matches = peid.match(pe, ep_only=True)
+#            if matches:
+#                for match in matches:
+#                    packers.append(match)
+        return packers
+
+
 
     @staticmethod
-    def check_yara(rule, data):
+    def check_yara(pe):
         """Determines if a PE file flags on any provided Yara signatures"""
         rules = []
-        if 'yara' in sys.modules and rule:
-            try:
-                for hit in rule.match(data=data):
-                    rules.append("Rule: {0}".format(hit.rule))
-                    for (key, name, value) in hit.strings:
-                        pair = (hex(key), value)
-                        if all(char in string.printable for char in value):
-                            pair = (hex(key), binascii.hexlify(value))
-                        rules.append("{0:>3} => {1}".format(*pair))
-                rules = [self.subheader("Yara Hits"), NF.join(rules)]
-                print(NF.join(rules))
-            except Exception as e:
-                logging.error("File: {0} [Line {1}: {2}]".format(self.FILE, sys.exc_info()[-1].tb_lineno, e))
+#        rule = yara.compile(self.ARGS['YARA']) if self.ARGS['YARA'] and 'yara' in sys.modules else None
+#        if 'yara' in sys.modules and rule:
+#            for hit in rule.match(data=pe.write()):
+#                rules.append("Rule: {0}".format(hit.rule))
+#                for (key, name, value) in hit.strings:
+#                    pair = (hex(key), value)
+#                    if all(char in string.printable for char in value):
+#                        pair = (hex(key), binascii.hexlify(value))
+#                    rules.append("{0:>3} => {1}".format(*pair))
+        return rules
 
-    def check_tls(self, pe):
-        """Determines the TLS (Thread Local Storage) callbacks in a PE file"""
+    @staticmethod
+    def check_tls(pe):
+        """Returns a PE files TLS (Thread Local Storage) callbacks"""
         # See Ero Carrera's blog http://blog.dkbza.org/2007/03/pe-trick-thread-local-storage.html for more info
         callbacks = []
-        try:
-            if hasattr(pe, 'DIRECTORY_ENTRY_TLS') and pe.DIRECTORY_ENTRY_TLS and pe.DIRECTORY_ENTRY_TLS.struct and \
-                    pe.DIRECTORY_ENTRY_TLS.struct.AddressOfCallBacks:
-                callback_array_rva = pe.DIRECTORY_ENTRY_TLS.struct.AddressOfCallBacks - \
-                                     pe.OPTIONAL_HEADER.ImageBase
-                idx = 0
+        if hasattr(pe, 'DIRECTORY_ENTRY_TLS') and pe.DIRECTORY_ENTRY_TLS and pe.DIRECTORY_ENTRY_TLS.struct and pe.DIRECTORY_ENTRY_TLS.struct.AddressOfCallBacks:
+            # Tested a bunch of binaries, including carved binaries (ie. possibility of corruption)
+            # If AdressOfCallBacks < ImageBase, the initial RVA is negative which would -almost always- result in the following (or very similar) callback addresses:
+            #  - 0x300
+            #  - 0x400
+            #  - 0xffff00
+            #  - 0xb800
+            # Given this, if AddressOfCallBacks < ImageBase, assume binary is corrupt and ignore
+            if pe.DIRECTORY_ENTRY_TLS.struct.AddressOfCallBacks > pe.OPTIONAL_HEADER.ImageBase:
+                callback_initial_rva = pe.DIRECTORY_ENTRY_TLS.struct.AddressOfCallBacks - pe.OPTIONAL_HEADER.ImageBase
+                function = None
+                index = 0
                 while True:
                     try:
-                        function = pe.get_dword_from_data(pe.get_data(callback_array_rva + 4 * idx, 4), 0)
+                        function = pe.get_dword_from_data(pe.get_data(callback_initial_rva + 4 * index, 4), 0)
                     except pefile.PEFormatError:
                         break
                     if function == 0:
                         break
-                    callbacks.append(function)
-                    idx += 1
-        except Exception as e:
-            logging.error("File: {0} [Line {1}: {2}]".format(self.FILE, sys.exc_info()[-1].tb_lineno, e))
-        if callbacks:
-            callbacks = [self.subheader("TLS Callbacks"),
-                         NF.join(["0x{:<4x}".format(callback) for callback in callbacks])]
-            print(NF.join(callbacks))
+                    if function:
+                        callbacks.append([hex(int(function))])
+                    index+=1
+        return callbacks
 
     def check_resources(self, pe):
-        """Determines the resource entries in a PE file"""
+        """Returns the resource entries in a PE file"""
         resources = []
-        try:
-            if hasattr(pe, 'DIRECTORY_ENTRY_RESOURCE'):
-                types = [type for type in pe.DIRECTORY_ENTRY_RESOURCE.entries if hasattr(type, 'directory')]
-                for type in types:
-                    if type.name is not None:
-                        name = "{0}".format(type.name)
-                    elif pefile.RESOURCE_TYPE.get(type.struct.Id) is not None:
-                        name = "{0}".format(pefile.RESOURCE_TYPE.get(type.struct.Id))
-                    else:
-                        name = "{0:d}".format(type.struct.Id)
-                    identifiers = [id for id in type.directory.entries if hasattr(id, 'directory')]
-                    for identifier in identifiers:
-                        language_ids = [lang for lang in identifier.directory.entries]
-                        for language_id in language_ids:
-                            offset = language_id.data.struct.OffsetToData
-                            size = language_id.data.struct.Size
+        # Top-level directory 'DIRECTORY_ENTRY_RESOURCE' found at beginning of resource section (.rsrc)
+        if hasattr(pe, 'DIRECTORY_ENTRY_RESOURCE'):
+            # Subdirectories of top-level directory correspond to the various types of resources found in the file
+            for type_ in [ _ for _ in pe.DIRECTORY_ENTRY_RESOURCE.entries if hasattr(_, 'directory') ]:
+                # IMAGE_RESOURCE_DIRECTORY_ENTRY Format
+                # Name field (dword) contains either an integer ID or a pointer to a structure that contains a string name
+                # If string name not present, integer ID used to search for known resource directory names
+                # Otherwise integer ID used as name
+                if type_.name:
+                    name = str(type_.name)
+                elif pefile.RESOURCE_TYPE.get(type_.struct.Id):
+                    name = str(pefile.RESOURCE_TYPE.get(type_.struct.Id))
+                else:
+                    name = str(type_.struct.Id)
+                # Each of these type subdirectories will in turn have ID subdirectories
+                # There will be one ID subdirectory for each instance of a given resource type
+                for ID in [ _ for _ in type_.directory.entries if hasattr(_, 'directory') ]:
+                    for lang_ID in [ _ for _ in ID.directory.entries ]:
+                        size   = lang_ID.data.struct.Size
+                        offset = lang_ID.data.struct.OffsetToData
+                        try:
                             data = pe.get_data(offset, size)
-                            filetype = self.get_filetype(data)
-                            language = pefile.LANG.get(language_id.data.lang, '*unknown*')
-                            sublanguage = pefile.get_sublang_name_for_lang(language_id.data.lang,
-                                                                           language_id.data.sublang)
-                            hex_dump = hexdump(data, result='return').split('\n')[0] \
-                                if imp.find_module('hexdump') else None
-                            resources.append([name, offset, size, language, sublanguage, filetype, hex_dump])
-        except Exception as e:
-            logging.error("File: {0} [Line {1}: {2}]".format(self.FILE, sys.exc_info()[-1].tb_lineno, e))
-        if resources:
-            s = "{0:<17} {1:<8} {2:<8} {3:<15} {4:<27} {5:<75} {6}"
-            resources = [self.subheader("Resource Entries"),
-                         s.format("Name", "RVA", "Size", "Language", "Sublanguage", "Type", "Data"), ("-" * 235),
-                         NF.join([s.format(*resource) for resource in resources])]
-            print(NF.join(resources))
+                        except pefile.PEFormatError:
+                            data = str()
+                        filetype = self.get_filetype(data)
+                        language = pefile.LANG.get(lang_ID.data.lang, 'LANG_UNKNOWN')
+                        sublanguage = pefile.get_sublang_name_for_lang(lang_ID.data.lang, lang_ID.data.sublang)
+                        hd = re.split(": ", hexdump.hexdump(data, result='return').split('\n')[0], 1)[1] if 'hexdump' in sys.modules and len(data) > 0 else None
+                        resources.append([name, offset, size, language, sublanguage, filetype, hd])
+        return resources
 
-    def check_imports(self, pe):
-        """Determines if a PE file is importing any libraries and whether any of those library's APIs are
-        regarded as suspicious from a malware perspective"""
-        api_alerts = ['OpenProcess', 'CreateProcess', 'VirtualAllocEx', 'WriteProcessMemory', 'ReadProcessMemory',
-                      'CreateRemoteThread', 'WinExec', 'ShellExecute', 'HttpSendRequest', 'InternetReadFile',
-                      'InternetConnect', 'CreateService', 'StartService', 'IsDebuggerPresent', 'Sleep', 'DecodePointer',
-                      'EncodePointer', 'CreateNamedPipe', 'PeekNamedPipe', 'CallNamedPipe']
-        dlls = []
-        imports = []
-        try:
-            if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
-                for library in [library for library in pe.DIRECTORY_ENTRY_IMPORT]:
-                    dlls.append(library.dll)
-                    APIs = [API.name for API in library.imports if API.name]
-                    for API in APIs:
-                        for alert in api_alerts:
-                            if API.startswith(alert):
-                                imports.append(API)
-        except Exception as e:
-            logging.error("File: {0} [Line {1}: {2}]".format(self.FILE, sys.exc_info()[-1].tb_lineno, e))
-        if dlls:
-            dlls = [self.subheader("Imports"), NF.join(dlls)]
-            print(NF.join(dlls))
-        if imports:
-            imports = [self.subheader("Suspicious IAT Alerts"), NF.join(imports)]
-            print(NF.join(imports))
+    @staticmethod
+    def check_imported_libraries(pe):
+        """Returns any libraries imported by a PE file"""
+        DLLs = []
+        if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+            for library in [ _ for _ in pe.DIRECTORY_ENTRY_IMPORT ]:
+                # Alert if DLL is in list of user-defined DLL alerts
+                DLL = [library.dll, "*"] if library.dll.lower() in DLL_ALERTS else [library.dll]
+                DLLs.append(DLL)
+        return DLLs
 
-    def check_exports(self, pe):
-        """Determines if a PE file is exporting any functions"""
-        dll = None
+    @staticmethod
+    def check_api_calls(pe):
+        """Determines whether API calls from any imported libraries are regarded as suspicious (from a malware perspective)"""
+        APIs = []
+        if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+            for library in [ _ for _ in pe.DIRECTORY_ENTRY_IMPORT ]:
+                # Alert if the PE file is calling any user-defined Windows API functions regarded as suspicious;
+                # Or any Native API functions exported by ntdll.dll (starting with Nt or Zw)
+                # There is functionality provided in Native API that is not exposed to Windows API, however most programs will not call the Native API directly.
+                for API in [ _.name for _ in library.imports if _.name ]:
+                    for alert in API_ALERTS:
+                        if API.startswith(alert) or API.endswith(alert):
+                            APIs.append([API])
+                            break
+        return APIs
+
+    @staticmethod
+    def check_exports(pe):
+        """Returns any functions exported by a PE file"""
         exports = []
-        try:
-            if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
-                dll = pe.get_string_at_rva(pe.DIRECTORY_ENTRY_EXPORT.struct.Name)
-                for export in [export for export in pe.DIRECTORY_ENTRY_EXPORT.symbols]:
-                    exports.append(["{0:#0{1}x}".format(pe.OPTIONAL_HEADER.ImageBase + export.address, 10),
-                                    str(export.ordinal).zfill(4), export.name])
-        except Exception as e:
-            logging.error("File: {0} [Line {1}: {2}]".format(self.FILE, sys.exc_info()[-1].tb_lineno, e))
-        if exports:
-            s = "{0:<11} {1} {2}"
-            exports = [self.subheader("EAT ({0})".format(dll)), s.format("VirtAddr", "Ordinal", "Name"), ("-" * 235),
-                       NF.join([s.format(*export) for export in exports])]
-            print(NF.join(exports))
+        if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+            for export in [ _ for _ in pe.DIRECTORY_ENTRY_EXPORT.symbols ]:
+                exports.append(["{0:#0{1}x}".format(pe.OPTIONAL_HEADER.ImageBase + export.address, 10), export.name, export.ordinal])
+        return exports
 
     def check_sections(self, pe):
-        """Determines the sections of a PE file"""
+        """Returns the sections of a PE file"""
         sections = []
-        try:
-            for section in pe.sections:
-                s = "{0:<10} {1:<12} {2:<12} {3:<12} {4:<12}"
-                entropy = section.get_entropy()
-                s = WARNING + s + END if section.SizeOfRawData == 0 or (0 < entropy < 1) or entropy > 7 else s
-                section = ["".join([ch for ch in section.Name if ch in string.printable]),
-                           hex(section.VirtualAddress),
-                           hex(section.Misc_VirtualSize),
-                           hex(section.SizeOfRawData),
-                           entropy]
-                sections.append(s.format(*section))
-        except Exception as e:
-            logging.error("File: {0} [Line {1}: {2}]".format(self.FILE, sys.exc_info()[-1].tb_lineno, e))
-        if sections:
-            sections = [self.subheader("Sections"),
-                        "{0:<10} {1:<12} {2:<12} {3:<12} {4:<12}".format("Name", "VirtAddr", "VirtSize", "RawSize",
-                                                                         "Entropy"), ("-" * 235),
-                        NF.join(section for section in sections), "-" * 235]
-            print(NF.join(sections))
+        for section in pe.sections: 
+            s = [self.convert_to_printable(section.Name),
+                 hex(section.VirtualAddress),
+                 hex(section.Misc_VirtualSize),
+                 hex(section.SizeOfRawData),
+                 section.get_entropy()]
+            s = [s, "*"] if section.SizeOfRawData == 0 or (0 < section.get_entropy() < 1) or section.get_entropy() > 7 else [s]
+            sections.append(s)
+        return sections
 
     def check_version_info(self, pe):
-        """Determines the version information of a PE file"""
+        """Returns the version information of a PE file"""
         version_info = []
-        try:
-            if hasattr(pe, 'VS_VERSIONINFO'):
-                for element in [element for element in pe.FileInfo if hasattr(pe, 'FileInfo')]:
-                    if hasattr(element, 'StringTable'):
-                        for table in [table for table in element.StringTable]:
-                            for item in [item for item in table.entries.items()]:
-                                version_info.append("{0:<20} {1}".format(convert_to_printable(item[0]) + ':',
-                                                                         convert_to_printable(item[1])))
-                    elif hasattr(element, 'Var'):
-                        for variable in [variable for variable in element.Var if hasattr(variable, 'entry')]:
-                            version_info.append("{0:<20} {1}".format(convert_to_printable(variable.entry.keys()[0])
-                                                                     + ":", variable.entry.values()[0]))
-        except Exception as e:
-            logging.error("File: {0} [Line {1}: {2}]".format(self.FILE, sys.exc_info()[-1].tb_lineno, e))
-        if version_info:
-            version_info = [self.subheader("Version Information"), NF.join(version_info)]
-            print(NF.join(version_info))
+        if hasattr(pe, 'VS_VERSIONINFO'):
+            for element in [ _ for _ in pe.FileInfo if hasattr(pe, 'FileInfo') ]:
+                if hasattr(element, 'StringTable'):
+                    for table in [ _ for _ in element.StringTable ]:
+                        for item in [ _ for _ in table.entries.items() ]:
+                            version_info.append([self.convert_to_printable(item[0]), self.convert_to_printable(item[1])])
+                elif hasattr(element, 'Var'):
+                    for variable in [ _ for _ in element.Var if hasattr(_, 'entry') ]:
+                        version_info.append([self.convert_to_printable(variable.entry.keys()[0]), variable.entry.values()[0]])
+        return version_info
 
-    def scan(self):
-        """Main scanning function"""
-        try:
-            object = self.ARGS['INPUT']
-            files = []
-            if os.path.isdir(object):
-                for root, directories, filenames in os.walk(object):
+    def collect(self):
+        binaries = []
+        for obj in self.ARGS['INPUT']:
+            if os.path.isdir(obj):
+                for root, directories, filenames in os.walk(obj):
                     for filename in filenames:
-                        abspath = os.path.join(root, filename)
-                        why = self.check_file_attributes(abspath)
-                        if why:
-                            print(FAIL + "Did not scan {0}: {1}".format(os.path.basename(filename), why) + END)
-                            print()
-                            continue
-                        files.append(abspath)
-            elif os.path.isfile(object):
-                files.append(object)
+                        binaries.append(os.path.join(root, filename))
+            elif os.path.isfile(obj):
+                binaries.append(obj)
 
-            rule = yara.compile(self.ARGS['YARA']) if self.ARGS['YARA'] and 'yara' in sys.modules else None
-            peid = peutils.SignatureDatabase(self.ARGS['PEID']) if self.ARGS['PEID'] else None
+        print("[+] Number of files to scan:", len(binaries))
 
-            count = 0
-            for file in files:
-                self.FILE = file
-                data = open(file, 'rb').read()
-                pe = pefile.PE(data=data, fast_load=True)
+        # Check if imphash.db already exists; if not, create it then load it; else just load it
+        while not self.IMPHASHES:
+            if os.path.isfile(IMPHASH_DB):
+                with open(IMPHASH_DB, 'rb') as database:
+                    self.IMPHASHES = cPickle.load(database)
+            else:
+                with open(IMPHASH_DB, 'wb') as database:
+                    cPickle.dump({'Created': datetime.datetime.now().isoformat()}, database) # Dummy creation date field to help break out of while loop
+
+        e = 0
+        c = 0
+        self.progress_start()
+        for binary in binaries:
+            scanned = None
+            try:
+                pe = pefile.PE(binary, fast_load=True)
+            except pefile.PEFormatError:
+                e+=1
+            else:
+                c+=1
                 try:
                     pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT'],
                                                            pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT'],
                                                            pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_TLS'],
                                                            pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE']])
-                except AttributeError:
+                except (pefile.PEFormatError, AttributeError):
                     pass
                 finally:
-                    self.header(count)
-                    self.get_metdata(pe, file, data)
-                    self.check_imphash(pe, data)
-                    self.check_packers(pe, peid)
-                    self.check_yara(rule, data)
-                    self.check_tls(pe)
-                    self.check_resources(pe)
-                    self.check_imports(pe)
-                    self.check_exports(pe)
-                    self.check_sections(pe)
-                    self.check_version_info(pe)
-                    print()
-                    count += 1
-        except KeyboardInterrupt:
-            print("KeyboardInterrupt")
+                    scanned = {'Metadata':            {'File':         [os.path.basename(binary)],
+                                                       'Size':         ["{0:,d} bytes".format(len(bytearray(pe.__data__)))],
+                                                       'Type':         [self.get_filetype(pe)],
+                                                       'MD5':          [hashlib.md5(bytearray(pe.__data__)).hexdigest()],
+                                                       'SHA1':         [hashlib.sha1(bytearray(pe.__data__)).hexdigest()],
+                                                       'Imphash':      [pe.get_imphash()],
+                                                       'Compile Date': list(self.get_time_date_stamp(pe)),
+                                                       'EP':           list(self.check_ep_section(pe)),
+                                                       'CRC':          list(self.check_crc(pe))},
+                               'Import Hash Matches': list(self.check_imphash(pe)),
+                               'Packers':             list(self.check_packers(pe)),
+                               'Yara Rule Matches':   list(self.check_yara(pe)),
+                               'TLS Callbacks':       list(self.check_tls(pe)),
+                               'Resources':           list(self.check_resources(pe)),
+                               'Imported Libraries':  list(self.check_imported_libraries(pe)),
+                               'API Alerts':          list(self.check_api_calls(pe)),
+                               'Exports':             list(self.check_exports(pe)),
+                               'Sections':            list(self.check_sections(pe)),
+                               'Version Information': list(self.check_version_info(pe))}
+            finally:
+                if 'stdout' in self.ARGS['OUTPUT'].name:
+                    self.print_to_stdout(scanned)
+                else:
+                    self.save_to_html(scanned, c == 1, c + e == len(binaries))
+                self.progress_update(c + e, len(binaries))
+        self.progress_end()
 
+        # Save changes made to the import hash database to imphash.db
+        with open(IMPHASH_DB, 'wb') as database:
+            cPickle.dump(self.IMPHASHES, database)
+
+        print("".join(self.OUTPUT), file=self.ARGS['OUTPUT'])
+
+    @staticmethod
+    def cgi_escape(value):
+        return [ cgi.escape(str(_)) for _ in value ] if isinstance(value[0], str) else [[ cgi.escape(str(_)) for _ in value[0] ]]        
+
+    def save_to_html(self, scanned, first=False, last=False):
+
+        if first and not self.LOCKED:
+            with open(os.path.join(SCRIPT_PATH, 'pe-scanner-html-template'), mode='r') as template:
+                self.OUTPUT.append(template.read().format(JQUERY_FILE_PATH, self.SCAN_TIME))
+                self.LOCKED = True # Lock access to appending template to output
+
+        if scanned:
+
+            self.OUTPUT.append("""<table class="outer">
+    <tr class="expand">
+        <th>{0}</th>
+        <th class="sign"><span>[+]</span></th>
+    </tr>
+    <tr class="hidden">
+        <td colspan="2">
+            """.format(scanned['Metadata']['File'][0]))
+
+            for attribute in ['Metadata', 'Import Hash Matches', 'Packers', 'Yara Rule Matches', 'TLS Callbacks', 'Resources', 'Imported Libraries', 'API Alerts', 'Exports', 'Sections', 'Version Information']:
+                if scanned[attribute]:
+                    if attribute == 'Metadata':
+                        self.OUTPUT.append("""<table class="inner metadata">
+            <colgroup><col><col></colgroup>
+                <tr class="collapse">
+                    <th colspan="2">{0}</th>
+                    <th class="sign"><span>[-]</span></th>
+                </tr>""".format(attribute))
+
+                        for sub_attr in ['File', 'Size', 'Type', 'MD5', 'SHA1', 'Imphash', 'Compile Date', 'EP', 'CRC']:
+                            if "*" in scanned[attribute][sub_attr]:
+                                self.OUTPUT.append("""
+                <tr class="suspicious">
+                    <td>{0}:</td>
+                    <td>{1}</td>
+                </tr>""".format(sub_attr, scanned[attribute][sub_attr][0]))
+                            else:
+                                self.OUTPUT.append("""
+                <tr>
+                    <td>{0}:</td>
+                    <td>{1}</td>
+                </tr>""".format(sub_attr, scanned[attribute][sub_attr][0]))
+
+                        self.OUTPUT.append("""
+            </table>
+
+            """)
+
+                    if attribute in ('Import Hash Matches', 'TLS Callbacks', 'Imported Libraries', 'API Alerts'):
+                        self.OUTPUT.append("""<table class="inner">
+                <tr class="collapse">
+                    <th colspan="2">{0}</th>
+                    <th class="sign"><span>[-]</span></th>
+                </tr>""".format(attribute))
+
+                        for value in scanned[attribute]:
+                            if "*" in value:
+                                self.OUTPUT.append("""
+                <tr class="suspcicious">
+                    <td>{0}</td>
+                </tr>""".format(*self.cgi_escape(value)))
+                            else:
+                                self.OUTPUT.append("""
+                <tr>
+                    <td>{0}</td>
+                </tr>""".format(*self.cgi_escape(value)))
+                        self.OUTPUT.append("""
+            </table>
+
+            """)
+
+                    if attribute == 'Packers':
+                        pass
+
+                    if attribute == 'Yara Rule Matches':
+                        pass
+
+                    if attribute == 'Resources':
+                        self.OUTPUT.append("""<table class="inner resources">
+            <colgroup><col><col><col><col><col><col><col></colgroup>
+                <tr class="collapse">
+                    <th colspan="7">{0}</th>
+                    <th class="sign"><span>[-]</span></th>
+                </tr>
+                <tr class="dotted-border">
+                    <td>Name</td>
+                    <td>RVA</td>
+                    <td>Size</td>
+                    <td>Language</td>
+                    <td>Sublanguage</td>
+                    <td>Type</td>
+                    <td>Data</td>
+                </tr>""".format(attribute))
+
+                        for value in scanned[attribute]:
+                            self.OUTPUT.append("""
+                <tr>
+                    <td>{0}</td>
+                    <td>{1}</td>
+                    <td>{2}</td>
+                    <td>{3}</td>
+                    <td>{4}</td>
+                    <td>{5}</td>
+                    <td>{6}</td>
+                </tr>""".format(*self.cgi_escape(value)))
+
+                        self.OUTPUT.append("""
+            </table>
+
+            """)
+
+                    if attribute == 'Exports':
+                        self.OUTPUT.append("""<table class="inner exports">
+            <colgroup><col><col><col></colgroup>
+                <tr class="collapse">
+                    <th colspan="2">{0}</th>
+                    <th class="sign"><span>[-]</span></th>
+                </tr>
+                <tr class="dotted-border">
+                    <td>VirtAddr</td>
+                    <td>Name (Ordinal)</td>
+                </tr>""".format(attribute))
+
+                        for value in scanned[attribute]:
+                            self.OUTPUT.append("""
+                <tr>
+                    <td>{0}</td>
+                    <td>{1} ({2})</td>
+                </tr>""".format(*self.cgi_escape(value)))
+
+                        self.OUTPUT.append("""
+            </table>
+
+            """)
+
+                    if attribute == 'Sections':
+                        self.OUTPUT.append("""<table class="inner sections">
+            <colgroup><col><col><col><col><col></colgroup>
+                <tr class="collapse">
+                    <th colspan="5">{0}</th>
+                    <th class="sign"><span>[-]</span></th>
+                </tr>
+                <tr class="dotted-border">
+                    <td>Name</td>
+                    <td>VirtAddr</td>
+                    <td>VirtSize</td>
+                    <td>RawSize</td>
+                    <td>Entropy</td>
+                </tr>""".format(attribute))
+
+                        for value in scanned[attribute]:
+                            if "*" in value:
+                                self.OUTPUT.append("""
+                <tr class="suspicious">
+                    <td>{0}</td>
+                    <td>{1}</td>
+                    <td>{2}</td>
+                    <td>{3}</td>
+                    <td>{4}</td>
+                </tr>""".format(*self.cgi_escape(value)[0]))
+                            else:
+                                self.OUTPUT.append("""
+                <tr>
+                    <td>{0}</td>
+                    <td>{1}</td>
+                    <td>{2}</td>
+                    <td>{3}</td>
+                    <td>{4}</td>
+                </tr>""".format(*self.cgi_escape(value)[0]))
+
+                        self.OUTPUT.append("""
+            </table>
+
+            """)
+
+                    if attribute == 'Version Information':
+                        self.OUTPUT.append("""<table class="inner version">
+            <colgroup><col></colgroup>
+                <tr class="collapse">
+                    <th colspan="2">{0}</th>
+                    <th class="sign"><span>[-]</span></th>
+                </tr>""".format(attribute))
+
+                        for value in scanned[attribute]:
+                            self.OUTPUT.append("""
+                <tr>
+                    <td>{0}:</td>
+                    <td>{1}</td>
+                </tr>""".format(*value))
+
+                        self.OUTPUT.append("""
+            </table>
+
+            """)
+
+            self.OUTPUT.append("""
+        </td>
+    </tr>
+</table>
+
+""")
+
+        if last:
+            self.OUTPUT.append("""<br /><br />
+</body>
+</html>""")
+
+
+    @staticmethod
+    def header(filename):
+        filename = " {0} ".format(filename)
+        if len(filename) % 2 != 0: # If length of filename isn't even, append an additional # to the filename to make everything look pretty and symmetric
+            filename += "#"
+        return Colours.HEADING + "{0}{1}{0}".format("#" * ((250 - len(filename)) / 2), filename) + Colours.END + "\n"
+
+    @staticmethod
+    def subheader(message):
+        return "\n" + message + "\n" + "=" * 250 + "\n"
+
+    def print_to_stdout(self, scanned):
+        if scanned:
+            self.OUTPUT.append(self.header(scanned['Metadata']['File'][0]))
+            for attribute in ['Metadata', 'Import Hash Matches', 'Packers', 'Yara Rule Matches', 'TLS Callbacks', 'Resources', 'Imported Libraries', 'API Alerts', 'Exports', 'Sections', 'Version Information']:
+                if scanned[attribute]:
+                    if attribute == 'Metadata':
+                        _ = "{0:<13} {1}" + "\n"
+                        self.OUTPUT.append(self.subheader(attribute))
+                        for sub_attr in ['File', 'Size', 'Type', 'MD5', 'SHA1', 'Imphash', 'Compile Date', 'EP', 'CRC']:
+                            if "*" in scanned[attribute][sub_attr]:
+                                self.OUTPUT.append(Colours.WARNING + _.format(sub_attr + ":", scanned[attribute][sub_attr][0]) + Colours.END)
+                            else:
+                                self.OUTPUT.append(_.format(sub_attr + ":", scanned[attribute][sub_attr][0]))
+
+                    if attribute in ('Import Hash Matches', 'TLS Callbacks', 'Imported Libraries', 'API Alerts'):
+                        self.OUTPUT.append(self.subheader(attribute))
+                        for value in scanned[attribute]:
+                            if "*" in value:
+                                self.OUTPUT.append(Colours.WARNING + value[0] + Colours.END + "\n")
+                            else:
+                                self.OUTPUT.append(value[0] + "\n")
+
+                    if attribute == 'Packers':
+                        pass
+
+                    if attribute == 'Yara Rule Matches':
+                        pass
+
+                    if attribute == 'Resources':
+                        _ = "{0:<20} {1:<7} {2:<7} {3:<19} {4:<34} {5:<75} {6}" + "\n"
+                        self.OUTPUT.extend([self.subheader(attribute), _.format("Name", "RVA", "Size", "Language", "Sublanguage", "Type", "Data")])
+                        for value in scanned[attribute]:
+                            self.OUTPUT.append(_.format(*value))
+
+                    if attribute == 'Exports':
+                        _ = "{0:<11} {1} ({2})" + "\n"
+                        self.OUTPUT.extend([self.subheader(attribute), _.format("VirtAddr", "Name", "Ordinal")])
+                        for value in scanned[attribute]:
+                            self.OUTPUT.append(_.format(*value))
+
+                    if attribute == 'Sections':
+                        _ = "{0:<10} {1:<12} {2:<12} {3:<12} {4:<12}" + "\n"
+                        self.OUTPUT.extend([self.subheader(attribute), _.format("Name", "VirtAddr", "VirtSize", "RawSize", "Entropy")])
+                        for value in scanned[attribute]:
+                            if "*" in value:
+                                self.OUTPUT.append(Colours.WARNING + _.format(*value[0]) + Colours.END)
+                            else:
+                                self.OUTPUT.append(_.format(*value[0]))
+
+                    if attribute == 'Version Information':
+                        _ = "{0:<20} {1}" + "\n"
+                        self.OUTPUT.append(self.subheader(attribute))
+                        for value in scanned[attribute]:
+                            self.OUTPUT.append(_.format(value[0] + ":", value[1]))
+
+            self.OUTPUT.append("\n")
 
 if __name__ == '__main__':
     arguments()
