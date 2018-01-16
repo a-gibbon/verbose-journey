@@ -1,185 +1,242 @@
 #!/usr/bin/env python
-# Copyright (C) 2016
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
-#
-# Credit: Alexander Hanel (alexander<dot>hanel<at>gmail<dot>com)
-
 
 from __future__ import print_function
-from StringIO import StringIO
 
 import argparse
+import contextlib
+import hashlib
+import mmap
 import os
 import re
+import struct
 import sys
-
-END = "\x1b[0m"
-FAIL = "\x1b[0;30;41m"
-WARNING = "\x1b[0;30;43m"
-SUCCESS = "\x1b[0;30;42m"
+import time
 
 try:
     import pefile
 except ImportError:
-    print(FAIL + "pefile is not installed. Try pip install python-pefile or see http://code.google.com/p/pefile/" + END)
+    print("pefile is not installed. Try pip install python-pefile or see http://code.google.com/p/pefile/")
     sys.exit()
 
-os.nice(19)
-
+os.environ['COLUMNS'] = "125"
 
 def arguments():
-    """Parse arguments"""
     parser = argparse.ArgumentParser(description='Carves out Portable Executable files from arbitrary data',
                                      epilog='Example: pe-carver.py -D dump_dir -vv memory.dmp')
-    parser.add_argument(help='Input file name', type=check_arguments, dest='INPUT', metavar='<input>')
-    parser.add_argument('-D', help='Directory in which to dump carved PE files', type=check_arguments,
-                        default=os.path.abspath('.'), dest='OUTPUT', metavar='<output>')
-    parser.add_argument('-v', help='Print MZ location(s). Use -vv to print failed attempts', action='count',
-                        dest='VERBOSE', default=False)
-    parser.add_argument('--overlay', help='Size of overlay. Default: Disabled', action='store', type=int, default=0,
-                        dest='OVERLAY', metavar='<overlay>')
-    parser.add_argument('--size', help='Max size of carved binary (in bytes). Default: 10 MB', action='store', type=int,
-                        default=10485760, dest='SIZE', metavar='<size>')
+    parser.add_argument(help='input file name', type=check_arguments, dest='DATA')
+    parser.add_argument('-D', help='directory in which to dump carved PE files', default=os.path.curdir, type=check_arguments, dest='DUMP_DIR')
+    parser.add_argument('-v', help='-v: print successfully parsed PE files; -vv: print failed parsed PE files; -vvv: print both', action='count', dest='VERBOSE')
+    parser.add_argument('--overlay', help='include an overlay', action='store_true', default=False, dest='OVERLAY')
+    parser.add_argument('-s', help='overlay size. Default: 4096 bytes', default=4096, dest='SIZE')
     parser.set_defaults(func=Carver)
     args = parser.parse_args()
     args.func(vars(args))
 
+def check_arguments(obj):
+    """Check if arguments provided are valid and accessible"""
+    if os.path.isfile(obj):
+        if not os.access(obj, os.R_OK):
+            raise argparse.ArgumentTypeError("{0} is not accessible".format(obj))
+        if not os.path.getsize(obj) > 0:
+            raise argparse.ArgumentTypeError("{0} is an empty file".format(obj))
+        return os.path.abspath(obj)
+    if os.path.isdir(obj):
+        if not (os.access(obj, os.R_OK) and os.access(obj, os.X_OK)):
+            raise argparse.ArgumentTypeError("{0} is not accessible".format(obj))
+        return os.path.abspath(obj)
+    raise argparse.ArgumentTypeError("{0} is not a file or a directory".format(obj))
 
-def check_arguments(object):
-    """Check if file provided is valid, accessible and isn't 0 bytes"""
-    if not os.path.isfile(object) and not os.path.isdir(object):
-        raise argparse.ArgumentTypeError("{0} is not a file or a directory".format(os.path.basename(object)))
-    if (os.path.isfile(object) and not os.access(object, os.R_OK)) or \
-            (os.path.isdir(object) and not os.access(object, os.W_OK)):
-        raise argparse.ArgumentTypeError("{0} is not accessible".format(os.path.basename(object)))
-    if os.path.isfile(object) and not os.path.getsize(object) > 0:
-        raise argparse.ArgumentTypeError("{0} is an empty file".format(os.path.basename(object)))
-    return object
 
+class Colours:
+    END      = "\x1b[0m"
+    ERROR    = "\x1b[0;30;41m"
+    PATCHERR = "\x1b[3;30;41m"
+    SUCCESS  = "\x1b[0;30;42m"
+    WARNING  = "\x1b[0;30;43m"
 
 class Carver:
     def __init__(self, args):
-        """Initialiser"""
         self.ARGS = args
-        self.HANDLE = None
-        self.BUFFER = None
+        self.MMAP = None
         self.OFFSETS = []
-        self.print_header()
-        self.read_input()
-        self.find_offset()
-        self.carve_files()
+        self.print_info()
+        self.carve()
+
+    @staticmethod
+    def progress_start():
+        """Starts progress bar"""
+        sys.stdout.write("[-] Carving progress: " + "[" + "-" * 40 + "]" + "\r")
+        sys.stdout.flush()
+
+    @staticmethod
+    def progress_update(count, total):
+        """Updates progress bar"""
+        sys.stdout.write("[-] Carving progress: " + "[" + "#" * int(count * 40.0 / total) + "\r")
+        sys.stdout.flush()
+
+    @staticmethod
+    def progress_end():
+        """Finalises progress bar"""
+        sys.stdout.write("[#] Carving progress: " + "[" + "#" * 15 + " COMPLETE " + "#" * 15 + "]" + "\n")
+        sys.stdout.flush()
 
     @staticmethod
     def get_ext(pe):
         """Returns extension of the PE file depending on its file type"""
+        if pe.is_exe():
+            return '.exe'
         if pe.is_dll():
             return '.dll'
         if pe.is_driver():
             return '.sys'
-        if pe.is_exe():
-            return '.exe'
         return '.bin'
 
-    def enable_overlay(self, data, offset):
-        """Returns PE file with additional overlay size, otherwise returns original PE file"""
+    @staticmethod
+    def find_filename(pe):
+        """Attempts to return OriginalFilename or InternalName of PE file (if available)"""
         try:
-            self.HANDLE.seek(0)
-            self.HANDLE.seek(offset)
-            return self.HANDLE.read(len(data) + self.ARGS['SIZE'])
-        except (OverflowError, MemoryError):
-            return data
+            # Parse all entries in resource section of the PE file
+            pe.parse_data_directories(directories=pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE'])
+        except (pefile.PEFormatError, AttributeError):
+            return
+        else:
+            version_info = {}
+            ext = ('.exe', '.dll', '.sys')
+            if hasattr(pe, 'VS_VERSIONINFO'):
+                for element in [element for element in pe.FileInfo if hasattr(pe, 'FileInfo')]:
+                    if hasattr(element, 'StringTable'):
+                        for table in [table for table in element.StringTable]:
+                            for item in [item for item in table.entries.items()]:
+                                if item[0] in ('OriginalFilename', 'InternalName'):
+                                    version_info[item[0]] = item[1]
+                    elif hasattr(element, 'Var'):
+                        for variable in [variable for variable in element.Var if hasattr(variable, 'entry')]:
+                            if variable.entry.keys()[0] in ('OriginalFilename', 'InternalName'):
+                                version_info[variable.entry.keys()[0]] = variable.entry.values()[0]
+            if "OriginalFilename" in version_info.keys() and os.path.splitext(version_info['OriginalFilename'])[-1].lower() in ext:
+                return version_info['OriginalFilename']
+            elif "InternalName" in version_info.keys() and os.path.splitext(version_info["InternalName"])[-1].lower() in ext:
+                return version_info['InternalName']
+            return
 
-    def find_filename(self, pe):
-        """Returns OriginalFilename of PE file (if available)"""
-        version_info = {}
-        if hasattr(pe, 'VS_VERSIONINFO'):
-            for element in [element for element in pe.FileInfo if hasattr(pe, 'FileInfo')]:
-                if hasattr(element, 'StringTable'):
-                    for table in [table for table in element.StringTable]:
-                        for item in [item for item in table.entries.items()]:
-                            version_info[item[0]] = item[1]
-                elif hasattr(element, 'Var'):
-                    for variable in [variable for variable in element.Var if hasattr(variable, 'entry')]:
-                        version_info[variable.entry.keys()[0]] = variable.entry.values()[0]
-        exts = ['.exe', '.dll', '.sys']
-        if "OriginalFilename" in version_info.keys():
-            if os.path.splitext(version_info['OriginalFilename'])[-1] == str():
-                return os.path.splitext(version_info['OriginalFilename'])[-1] + self.get_ext(pe)
-            if os.path.splitext(version_info['OriginalFilename'])[-1].lower() not in exts:
-                if "InternalName" in version_info.keys() \
-                        and os.path.splitext(version_info["InternalName"])[-1].lower() in exts:
-                    return version_info['InternalName']
-                elif os.path.splitext(version_info['OriginalFilename'])[-1].lower() == ".mui":
-                    if os.path.splitext(os.splitext(version_info['OriginalFilename'])[0])[-1].lower() in exts:
-                        return os.splitext(version_info['OriginalFilename'])[0]
-            return version_info['OriginalFilename']
-        return
+    def include_overlay(self, pe, offset):
+        """
+        Returns PE file with overlay, otherwise returns original PE file size.
+           
+        Using default cluster size for NTFS -and- smallest possible page size as overlay length; ie. 4096 bytes
+        """
+        overlay_length = 4096 - (len(pe) % 4096)
+        if 0 < overlay_length < 4096:
+            try:
+                return self.MMAP[offset:offset+len(pe)+overlay_length]
+            except IndexError:
+                return pe
+        return pe
 
-    def print_header(self):
+    def print_info(self):
         """Prints user input information"""
-        print("[+] File to carve:  {0}".format(self.ARGS['INPUT']))
-        print("[+] Dump directory: {0}".format(self.ARGS['OUTPUT']))
+        print("[#] File to carve:   {0}".format(os.path.basename(self.ARGS['DATA'])))
+        print("[#] Dump directory:  {0}".format("./" + os.path.relpath(self.ARGS['DUMP_DIR']) if os.path.abspath('.') in self.ARGS['DUMP_DIR'] else self.ARGS['DUMP_DIR']))
         if self.ARGS['OVERLAY']:
-            print("[+] Overlay: " + SUCCESS + "Enabled" + END + " (Overlay size set to {0})".format(self.ARGS['SIZE']))
+            print("[#] Include overlay: " + Colours.SUCCESS + "Enabled"  + Colours.END + " (Overlay size set to {0} bytes)".format(self.ARGS['SIZE']))
         else:
-            print("[+] Overlay: " + WARNING + "Disabled" + END)
-        print("[-] Starting carving process")
+            print("[#] Include overlay: " + Colours.WARNING + "Disabled" + Colours.END)
 
-    def read_input(self):
-        """Reads the input file into a buffer"""
-        self.HANDLE = StringIO(open(self.ARGS['INPUT'], 'rb').read())
-        self.BUFFER = self.HANDLE.read()
+    def find_offsets(self):
+        """Finds the offsets to DOS header signature (ie. MZ) locations based off DOS program stub"""
+        sys.stdout.write("\r" + "[+] MS-DOS headers: Searching...")
+        sys.stdout.flush()
 
-    def find_offset(self):
-        """Finds the offsets of embedded PE files"""
-        self.OFFSETS = [offset for offset in [MZ.start() for MZ in re.finditer('\x4d\x5a', self.BUFFER)]]
+        # .{64}                                                             ~30 seconds
+        # .{6}\x00{2}\x04\x00{3}\xff{2}\x00{2}.{4}\x00{4}\x40\x00{35}.{4}   ~12 seconds
+        self.OFFSETS = [offset for offset in
+                       [_.start() for _ in re.finditer(r""".{6}\x00{2}\x04\x00{3}\xff{2}\x00{2}.{4}\x00{4}\x40\x00{35}.{4} # DOS header (64 bytes)
+                                                           \x0e\x1f(?:.{3}|.{7})\xb4\x09\xcd\x21\xb8\x01\x4c\xcd\x21       # DOS stub instructions
+                                                           This[ ]program[ ]cannot[ ]be[ ]run[ ]in[ ]DOS[ ]mode            # DOS stub message
+                                                           (?:\x2e\x0d)?\x0d\x0a\x24(?:\x00{5}|\x00{7})                    # DOS stub terminator""", 
+                                                           self.MMAP, re.X)]]
 
-    def write_output(self, pe, data, ext, count):
-        """Writes PE file to working or specified directory"""
-        filename = self.find_filename(pe)
-        if filename:
-            outname = os.path.join(self.ARGS['OUTPUT'], filename)
-        else:
-            outname = os.path.join(self.ARGS['OUTPUT'], str(count) + ext)
-        stream = open(outname, 'wb')
-        print(data, file=stream)
+        sys.stdout.write("\r" + "[#] MS-DOS headers: {0} found".format(len(self.OFFSETS)) + " " * 10 + "\n")
+        sys.stdout.flush()
+        time.sleep(0.5)
 
-    def carve_files(self):
+    def carve(self):
         """Carves out embedded PE files"""
-        try:
-            count = 1
-            for offset in self.OFFSETS:
-                self.HANDLE.seek(offset)
-                try:
-                    pe = pefile.PE(data=self.HANDLE.read(self.ARGS['SIZE']), fast_load=True)
-                    pe.parse_data_directories(directories=pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_RESOURCE'])
-                    ext = self.get_ext(pe)
-                except pefile.PEFormatError:
-                    if self.ARGS['VERBOSE'] == 2:
-                        print(FAIL + "[*] PE found @ {0}".format("{0:#0{1}x}".format(offset, 10)) + END)
-                    continue
-                if self.ARGS['VERBOSE'] > 0:
-                    print("[*] PE found @ {0}".format("{0:#0{1}x}".format(offset, 10)))
-                data = pe.trim()
-                if self.ARGS['OVERLAY']:
-                    data = enable_overlay(data, offset)
-                self.write_output(pe, data, ext, count)
-                self.HANDLE.seek(0)
-                count += 1
-        except KeyboardInterrupt:
-            print("KeyboardInterrupt")
+        with open(self.ARGS['DATA'], mode='r') as file:
+            with contextlib.closing(mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_COPY)) as self.MMAP:
+                self.find_offsets()
+                count = 0
+                carve = 0
+                messages = []
+                self.progress_start()
+                for offset in self.OFFSETS:
+                    pe = None
+                    patch = False
+                    message = "[-] MS-DOS header @ {0:#011x}: ".format(offset)
+                    while not pe:
+                        try:
+                            pe = pefile.PE(data=self.MMAP[offset:offset+5242880], fast_load=True) # Max binary size is 5MB
+                        except pefile.PEFormatError as error:
+
+                            dos_header = self.MMAP[offset:offset+64]
+
+                            if error.value == 'DOS Header magic not found.':
+                                self.MMAP[offset:offset+2] = bytes(bytearray([0x4D, 0x5A]))
+                                patch = True
+                            elif error.value == 'NT Headers not found.':
+                                pe_sig_offset = struct.unpack('<L', dos_header[60:64])[0]
+                                self.MMAP[offset+pe_sig_offset:offset+pe_sig_offset+4] = bytes(bytearray([0x50, 0x45, 0x00, 0x00]))
+                                patch = True
+                            else:
+                                if self.ARGS['VERBOSE'] in [2, 3]:
+                                    messages.append(Colours.PATCHERR + message + error.value + Colours.END if patch else Colours.ERROR + message + error.value + Colours.END)
+                                break
+                    if pe:
+                        # Return just the data defined by the PE headers
+                        data = pe.trim()
+
+                        # If overlay is required, determine overlay length and append to data
+                        if self.ARGS['OVERLAY']:
+                            data = self.include_overlay(data, offset)
+
+                        # Generate MD5 hash of PE file
+                        md5 = hashlib.md5(data).hexdigest()
+
+                        # Attempt to find the OriginalFilename or InternalName attributes for the PE file
+                        filename = self.find_filename(pe)
+
+                        if not filename:
+                            filename = md5 + self.get_ext(pe)
+                            outname  = os.path.join(self.ARGS['DUMP_DIR'], filename)
+                        else:
+                            outname  = os.path.join(self.ARGS['DUMP_DIR'], md5 + "-" + filename)
+                        
+
+                        if self.ARGS['VERBOSE'] in [1, 3]:
+                            messages.append(Colours.WARNING + message + filename + Colours.END if patch else message + filename)
+
+                        if not os.path.isfile(outname) and data:
+                            with open(outname, mode='w') as out:
+                                out.write(data)
+                                carve+=1
+
+                    count+=1
+                    self.progress_update(count, len(self.OFFSETS))
+                self.progress_end()
+                print("[#]", carve, "binaries carved")
+
+        if messages:
+            
+            # Legend
+            print()
+            print(Colours.WARNING  + " Patched                  " + Colours.END)
+            print(Colours.ERROR    + " PEFormatError            " + Colours.END)
+            print(Colours.PATCHERR + " Patched -> PEFormatError " + Colours.END)
+            print()
+            time.sleep(1)
+
+            print("\n".join(messages))
+
 
 if __name__ == '__main__':
     arguments()
