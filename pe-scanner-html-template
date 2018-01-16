@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<head>
+<script src="{0}"></script>
+<script>
+$(document).ready(function () {{
+    $('tr.expand').click(function () {{
+        $(this).find('span').text(function(_, value) {{
+            return value == '[-]' ? '[+]' : '[-]'
+        }});
+            $(this).nextUntil('tr.expand').css('display', function(i,v) {{
+                return this.style.display === 'table-row' ? 'none' : 'table-row';
+            }});
+    }});
+}});
+
+$(document).ready(function () {{
+    $('tr.collapse').click(function () {{
+        $(this).find('span').text(function(_, value) {{
+            return value == '[+]' ? '[-]' : '[+]'
+        }});
+            $(this).nextUntil('tr.collapse').css('display', function(i,v) {{
+                return this.style.display === 'none' ? 'table-row' : 'none';
+            }});
+    }});
+}});
+</script>
+
+<title>Scanned: {1}</title>
+
+<style type="text/css">
+html {{
+    overflow-y:scroll;
+    }}
+
+body {{
+    color:limegreen;
+    background:black;
+    font-family:monospace;
+    font-size:20px;
+    margin-top:0px;
+    margin-bottom:0px;
+    border-width:0px;
+    }}
+
+table {{
+    table-layout:fixed;
+    border-collapse:separate;
+    margin-left:auto;
+    margin-right:auto;
+    }}
+
+table.outer {{
+    width:95%;
+    }}
+
+table.inner {{
+    border-spacing:0px 1px;
+    width:100%;
+    }}
+
+tr {{
+    display:table-row;
+    }}
+
+tr.hidden {{
+    display:none;
+    }}
+
+tr.suspicious td,th {{
+    background-color:black;
+    font-weight:bold;
+    }}
+
+tr.dotted-border td {{
+    border-bottom:1px dashed green;
+    }}
+
+th {{
+    color:#fff;
+    border-width:0px;
+    font-family:monospace;
+    font-size:12px;
+    font-weight:bold;
+    white-space:-moz-pre-wrap;
+    white-space:-pre-wrap;
+    white-space:-o-pre-wrap;
+    white-space:no-wrap;
+    word-wrap:break-word;
+    margin-top:0px;
+    margin-bottom:0px;
+    margin-left:0px;
+    margin-right:0px;
+    text-align:left;
+    }}
+
+.outer th {{
+    background-color:#555;
+    }}
+
+.inner th {{
+    background-color:#222;
+    }}
+
+td {{
+    color:green;
+    background-color:#ccc;
+    border-width:0px;
+    font-family:monospace;
+    font-size:12px;
+    font-weight:bold;
+    white-space:-moz-pre-wrap;
+    white-space:-pre-wrap;
+    white-space:-o-pre-wrap;
+    white-space:no-wrap;
+    word-wrap:break-word;
+    margin-top:0px;
+    margin-bottom:0px;
+    margin-left:0px;
+    margin-right:0px;
+    text-align:left;
+    }}
+
+th.sign {{
+    cursor:pointer;
+    width:24px;
+    text-align:center;
+    }}
+
+.metadata col:nth-child(1) {{
+    width:125px;
+    }}
+
+.resources col:nth-child(1) {{
+    width:145px;
+    }}
+
+.resources col:nth-child(2) {{
+    width:55px;
+    }}
+
+.resources col:nth-child(3) {{
+    width:55px;
+    }}
+
+.resources col:nth-child(4) {{
+    width:140px;
+    }}
+
+.resources col:nth-child(5) {{
+    width:245px;
+    }}
+
+.resources col:nth-child(7) {{
+    width:450px;
+    }}
+
+.exports col:nth-child(1) {{
+    width:100px;
+    }}
+
+.sections col:nth-child(1) {{
+    width:150px;
+    }}
+
+.sections col:nth-child(2) {{
+    width:100px;
+    }}
+
+.sections col:nth-child(3) {{
+    width:100px;
+    }}
+
+.sections col:nth-child(4) {{
+    width:100px;
+    }}
+
+.version col:nth-child(1) {{
+    width:150px;
+    }}
+</style>
+</head>
+
+<body>
+<i>___PE-SCANNER</i>
+<br /><br />
+
