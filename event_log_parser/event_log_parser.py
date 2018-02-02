@@ -104,7 +104,7 @@ class Parser:
                 try:
                     writer.writerow(row[-1])
                 except UnicodeEncodeError:
-                    row[-1].update((k, v.encode('utf-8') for k, v in row[-1].items()))
+                    row[-1].update((k, v.encode('utf-8')) for k, v in row[-1].items())
                     writer.writerow(row[-1])
 
     def parse(self):
@@ -115,7 +115,7 @@ class Parser:
                 event = ET.ElementTree(ET.fromstring(self.strip_xml(record.xml()))).getroot()
                 ID = event[0].find('EventID').text
 
-                if ID in IDs:
+                if ID in self.ARGS['IDs']:
                     if ID not in self.EVENTS.keys():
                         print("[#] Found event ID {0:<5}".format(ID))
                         self.EVENTS[ID] = [[], []]
